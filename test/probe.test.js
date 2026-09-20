@@ -304,3 +304,19 @@ test('GitHub transport and collector compose for immutable comparisons and absen
   assert.equal((await collectEvidence(task, missing)).result, 'not_found');
   await assert.rejects(read('/repos/owner/../private'), /Invalid/);
 });
+
+test('merged PR is a distinct GitHub fact, not deployed work or a still-open draft', async t => {
+  const { task } = setup(t);
+  const merged = { state: 'closed', draft: false, merged: true, merged_at: '2026-09-19T12:00:00Z', merge_commit_sha: '4'.repeat(40) };
+  const result = await collectEvidence(task, evidence(task, { pr: merged }));
+  assert.equal(result.result, 'merged_pr'); assert.equal(result.mergeCommitSha, '4'.repeat(40));
+  assert.equal(result.stable, false); assert.equal(result.deployed, undefined); assert.equal(result.execution, undefined);
+  assert.equal((await collectEvidence(task, evidence(task, { pr: { ...merged, merged: false } }))).result, 'needs_review');
+});
+
+test('unrecognized fire receipt may retain only a canonical session link hint, never accepted authority', async () => {
+  const receipt = await fireRoutine({ routineId: spec.routineId, token: 'synthetic', text: '{}', fetchImpl: async () => response({ type: 'routine_fire', claude_code_session_id: 'opaque-id', claude_code_session_url: 'https://claude.ai/code/session_SAFE' }) });
+  assert.equal(receipt.outcome, 'unknown'); assert.equal(receipt.session, undefined); assert.equal(receipt.sessionUrlHint, 'https://claude.ai/code/session_SAFE');
+  const unsafe = await fireRoutine({ routineId: spec.routineId, token: 'synthetic', text: '{}', fetchImpl: async () => response({ type: 'routine_fire', claude_code_session_id: 'opaque-id', claude_code_session_url: 'https://attacker.example/session_SAFE' }) });
+  assert.equal(unsafe.sessionUrlHint, undefined);
+});

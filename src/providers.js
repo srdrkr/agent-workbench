@@ -59,7 +59,7 @@ export async function fireRoutine({ routineId, text, token, fetchImpl = fetch })
         retryAfterSeconds: /^\d{1,8}$/.test(retry) ? Number(retry) : null,
         latencyMs: Date.now() - started };
     }
-    return { outcome: 'unknown', status, diagnostics: responseDiagnostics(body, status), latencyMs: Date.now() - started };
+    return { outcome: 'unknown', status, ...(status === 200 && typeof body?.claude_code_session_url === 'string' && /^https:\/\/claude\.ai\/code\/session_[A-Za-z0-9_-]{1,100}$/.test(body.claude_code_session_url) ? { sessionUrlHint: body.claude_code_session_url } : {}), diagnostics: responseDiagnostics(body, status), latencyMs: Date.now() - started };
   } catch {
     // Timeout, connection loss, redirects and 5xx cannot prove that no session started.
     return { outcome: 'unknown', ...(status === undefined ? {} : { status }),
@@ -144,15 +144,19 @@ export async function collectEvidence(task, read) {
   });
   // A head change during the reads invalidates the snapshot instead of blessing stale CI.
   const current = await read(`${root}/pulls/${pr.number}`);
-  const stable = current.head?.sha === sha && current.head?.ref === task.branch &&
+  const sameIdentity = current.head?.sha === sha && current.head?.ref === task.branch &&
     current.head?.repo?.full_name === spec.repository && current.base?.ref === spec.baseBranch &&
     current.base?.repo?.full_name === spec.repository && current.body?.includes(task.marker) &&
-    current.base?.sha === spec.baseSha &&
+    (current.number === undefined || current.number === pr.number);
+  const merged = sameIdentity && current.state === 'closed' && current.merged === true
+    && Number.isFinite(Date.parse(current.merged_at)) && /^[a-f0-9]{40}$/.test(current.merge_commit_sha);
+  const stable = sameIdentity && current.base?.sha === spec.baseSha &&
     current.state === 'open' && current.draft === true && !current.merged_at;
   const tested = required.every(c => c.status === 'completed' && c.conclusion === 'success');
-  return { source: 'github_api', result: stable && approvedBase && scopeMatches && tested ? 'tested_draft_pr' : 'needs_review',
+  return { source: 'github_api', result: merged ? 'merged_pr' : stable && approvedBase && scopeMatches && tested ? 'tested_draft_pr' : 'needs_review',
     prNumber: pr.number, prUrl: `https://github.com/${spec.repository}/pull/${pr.number}`,
     headSha: sha, commitUrl: `https://github.com/${spec.repository}/commit/${sha}`,
+    ...(merged ? { mergedAt: current.merged_at, mergeCommitSha: current.merge_commit_sha } : {}),
     scopeMatches, stable, approvedBase, baseSha: spec.baseSha, requiredChecks: required,
     workerReport: { source: 'worker_self_report', present: Boolean(pr.body), verified: false } };
 }

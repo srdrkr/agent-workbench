@@ -30,7 +30,7 @@ export function validateProject(input) {
 
 export function validateProposal(p, project) {
     if (!fields(p, ['kind', 'candidateId', 'title', 'rationale', 'citations', 'question']) ||
-      !['coding', 'commitment', 'clarify'].includes(p.kind) || !text(p.title, 240) || !text(p.rationale, 2000) ||
+      !['coding', 'commitment', 'clarify', 'plan'].includes(p.kind) || !text(p.title, 240) || !text(p.rationale, 2000) ||
       !Array.isArray(p.citations) || !p.citations.length || p.citations.length > 12 ||
       p.citations.some(s => !project.sources.some(source => source.id === s)) ||
       (p.kind === 'clarify' ? !text(p.question, 500) : p.question !== null)) fail('Invalid proposal');

@@ -1,3 +1,4 @@
+import { reviewPilot, approvePilot, saveNote, completeCommitment, progressView } from './pilot.js';
 import { createHash } from 'node:crypto';
 import { attemptLimit, continuationPacket, reviewContinuation, approveContinuation, judgmentProject } from './continuation.js';
 import { previewContext, applyContext } from './context.js';
@@ -30,6 +31,15 @@ export function initialState(project, { model, budgetMicros }) {
 
 export class HostedSteward {
   constructor(store, judge, { now = () => new Date().toISOString(), coding = null } = {}) { this.store = store; this.judge = judge; this.now = now; this.coding = coding; }
+  reviewPilot(input) { return reviewPilot(this.store, input, this.now()); }
+  approvePilot(input) { return approvePilot(this.store, input, this.now()); }
+  saveNote(input) { return saveNote(this.store, input, this.now()); }
+  completeCommitment(input) { return completeCommitment(this.store, input, this.now()); }
+  async resume() { return this.store.change(state => {
+    requireValue(!Object.values(state.requests).some(r => ['thinking', 'held'].includes(r.status)) && !state.coding?.active, 'UNRESOLVED_MODEL_ATTEMPT');
+    state.paused = false; if (state.coding) state.coding.paused = false;
+    event(state, 'admission_resumed', {}, this.now()); return { paused: false };
+  }); }
   reviewContinuation() { return reviewContinuation(this.store, this.now()); }
   approveContinuation(input) { return approveContinuation(this.store, input, this.now()); }
   previewContext(project) { return previewContext(this.store, project, this.now()); }
@@ -40,8 +50,8 @@ export class HostedSteward {
     try { continuationPacket(state, this.now()); continuationAvailable = true; } catch { /* Fail closed until the run is verified and closed. */ }
     let continuationProblem = null;
     try { judgmentProject(state, this.now()); } catch (error) { continuationProblem = error.message; }
-    return { continuationAvailable, continuationProblem, project: state.project, contextFresh: fresh(state.project, this.now()), judge: state.model,
-      requests: Object.values(state.requests).reverse().slice(0, 50).map(r => ({ ...r, retryReviewHash: rejectionReviewHash(r) })), commitments: Object.values(state.commitments).filter(c => c.contextRevision === state.project.revision),
+    return { pilot: state.pilot ?? null, progress: progressView(state), monitor: state.monitor ? { lastCheckedAt: state.monitor.lastCheckedAt, lastError: state.monitor.lastError, notificationStatus: state.monitor.notificationStatus } : null, repeatableCoding: Boolean(this.coding?.config?.repeatable), continuationAvailable, continuationProblem, project: state.project, contextFresh: fresh(state.project, this.now()), judge: state.model,
+      requests: Object.values(state.requests).sort((a, b) => (b.createdAt ?? '').localeCompare(a.createdAt ?? '') || (b.id ?? '').localeCompare(a.id ?? '')).slice(0, 50).map(r => ({ ...r, retryReviewHash: rejectionReviewHash(r) })), commitments: Object.values(state.commitments).filter(c => c.contextRevision === state.project.revision),
       historicalCommitments: Object.values(state.commitments).filter(c => c.contextRevision !== state.project.revision),
       providerAttempts: Object.values(state.requests).filter(r => r.provider).length, maxProviderAttempts: attemptLimit(state),
       budgetMicros: state.budgetMicros, reservedMicros: state.reservedMicros, paused: state.paused,
@@ -70,7 +80,7 @@ export class HostedSteward {
       requireValue(!Object.values(state.requests).some(r => r !== failed && ['thinking', 'held'].includes(r.status)), 'UNRESOLVED_MODEL_ATTEMPT');
       requireValue(fresh(state.project, this.now()), 'CONTEXT_EXPIRED');
       requireValue(state.project.sources.every(s => s.exposure === 'model_allowed'), 'CONTEXT_NOT_APPROVED');
-      const commitments = Object.values(state.commitments).filter(c => c.contextRevision === state.project.revision);
+      const commitments = Object.values(state.commitments).filter(c => !c.completedAt && c.contextRevision === state.project.revision);
       const project = judgmentProject(state, this.now());
       const input = { request: message, project, commitments, hostedRequestId: requestId };
       requireValue(Buffer.byteLength(JSON.stringify(input)) <= 32768, 'CONTEXT_TOO_LARGE');
@@ -98,7 +108,11 @@ export class HostedSteward {
         record.proposalHash = digest({ projectId, contextRevision: record.contextRevision, proposal });
         record.status = proposal.kind === 'clarify' ? 'needs_context' : 'awaiting_approval';
       } catch {
-        record.status = 'held'; record.failure = 'judgment_unavailable_or_invalid';
+        record.status = record.provider?.intentAt ? 'held' : 'not_sent';
+        record.failure = record.provider?.intentAt ? 'judgment_unavailable_or_invalid' : 'provider_not_admitted';
+        if (record.status === 'not_sent' && record.retryOf && state.requests[record.retryOf]?.retryRequestId === record.id) {
+          delete state.requests[record.retryOf].retryRequestId;
+        }
       }
       record.completedAt = this.now();
       event(state, 'judgment_observed', { requestId, status: record.status }, this.now());
@@ -116,7 +130,7 @@ export class HostedSteward {
       requireValue(record.proposal.kind === 'commitment', 'CODING_NOT_ENABLED');
       if (record.status === 'approved') return record;
       record.status = 'approved'; record.approvedAt = this.now();
-      state.commitments[requestId] = { id: requestId, title: record.proposal.title, rationale: record.proposal.rationale,
+      state.commitments[requestId] = { id: requestId, projectId: state.project.id, title: record.proposal.title, rationale: record.proposal.rationale,
         citations: record.proposal.citations, contextRevision: record.contextRevision, approvedAt: record.approvedAt };
       event(state, 'commitment_approved', { requestId, proposalHash }, this.now());
       return record;

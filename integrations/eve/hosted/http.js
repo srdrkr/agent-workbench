@@ -1,6 +1,6 @@
 import { requireOwner } from './auth.js';
 const reply = (value, status = 200) => Response.json(value, { status, headers: { 'cache-control': 'no-store' } });
-const allowedErrors = new Set(['CONTINUATION_CONTEXT_CHANGED', 'CONTINUATION_UNAVAILABLE', 'CONTINUATION_REVIEW_STALE', 'CONTINUATION_SOURCE_EXPIRED', 'RETRY_REVIEW_MISMATCH', 'RETRY_NOT_READY', 'INVALID_REQUEST', 'REQUEST_ID_CONFLICT', 'ADMISSION_PAUSED', 'UNRESOLVED_MODEL_ATTEMPT', 'CONTEXT_EXPIRED', 'CONTEXT_NOT_APPROVED', 'CONTEXT_TOO_LARGE', 'APPROVAL_MISMATCH', 'APPROVAL_UNAVAILABLE', 'CODING_NOT_ENABLED', 'INVALID_CONTEXT', 'CONTEXT_WORK_UNRESOLVED', 'CONTEXT_PREVIEW_STALE', 'CONTEXT_CHANGE_LIMIT', 'CODING_APPROVAL_MISMATCH', 'CODING_ADMISSION_PAUSED', 'CODING_SCOPE_NOT_CONFIGURED', 'CODING_TASK_ALREADY_ATTEMPTED', 'CODING_PREFLIGHT_FAILED', 'CODING_EVIDENCE_UNAVAILABLE', 'CODING_OBSERVATION_INVALID', 'CODING_RELEASE_UNVERIFIED', 'CODING_TASK_UNKNOWN']);
+const allowedErrors = new Set(['PILOT_SETTINGS_INVALID', 'PILOT_REVIEW_STALE', 'MEMORY_LIMIT', 'PROGRESS_TOO_LARGE', 'CONTINUATION_CONTEXT_CHANGED', 'CONTINUATION_UNAVAILABLE', 'CONTINUATION_REVIEW_STALE', 'CONTINUATION_SOURCE_EXPIRED', 'RETRY_REVIEW_MISMATCH', 'RETRY_NOT_READY', 'INVALID_REQUEST', 'REQUEST_ID_CONFLICT', 'ADMISSION_PAUSED', 'UNRESOLVED_MODEL_ATTEMPT', 'CONTEXT_EXPIRED', 'CONTEXT_NOT_APPROVED', 'CONTEXT_TOO_LARGE', 'APPROVAL_MISMATCH', 'APPROVAL_UNAVAILABLE', 'CODING_NOT_ENABLED', 'INVALID_CONTEXT', 'CONTEXT_WORK_UNRESOLVED', 'CONTEXT_PREVIEW_STALE', 'CONTEXT_CHANGE_LIMIT', 'CODING_APPROVAL_MISMATCH', 'CODING_ADMISSION_PAUSED', 'CODING_SCOPE_NOT_CONFIGURED', 'CODING_TASK_ALREADY_ATTEMPTED', 'CODING_PREFLIGHT_FAILED', 'CODING_EVIDENCE_UNAVAILABLE', 'CODING_OBSERVATION_INVALID', 'CODING_RELEASE_UNVERIFIED', 'CODING_TASK_UNKNOWN']);
 export function hostedHandler({ auth, steward, ownerEmail, origin }) {
   return async request => {
     const path = new URL(request.url).pathname;
@@ -26,11 +26,13 @@ export function hostedHandler({ auth, steward, ownerEmail, origin }) {
       for (;;) { const { done, value } = await reader.read(); if (done) break; size += value.length; if (size > bodyLimit) { await reader.cancel(); return reply({ error: 'INVALID_REQUEST' }, 413); } chunks.push(Buffer.from(value)); }
       let input; try { input = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { return reply({ error: 'INVALID_REQUEST' }, 400); }
       if (!input || typeof input !== 'object' || Array.isArray(input)) return reply({ error: 'INVALID_REQUEST' }, 400);
+      const pilotActions = { '/api/steward/pilot/review': 'reviewPilot', '/api/steward/pilot/approve': 'approvePilot', '/api/steward/memory/note': 'saveNote', '/api/steward/commitment/complete': 'completeCommitment', '/api/steward/resume': 'resume' };
+      if (Object.hasOwn(pilotActions, path)) return reply(await steward[pilotActions[path]](input));
       if (path === '/api/steward/continuation/review') return reply(await steward.reviewContinuation());
       if (path === '/api/steward/continuation/approve') return reply(await steward.approveContinuation(input));
       if (path === '/api/steward/context/preview') return reply(await steward.previewContext(input.project));
       if (path === '/api/steward/context/apply') return reply(await steward.applyContext(input));
-      const codingActions = { '/api/steward/coding/review': 'review', '/api/steward/coding/approve': 'approveAndDispatch', '/api/steward/coding/reconcile': 'reconcile', '/api/steward/coding/observe': 'observe', '/api/steward/coding/release': 'release' };
+      const codingActions = { '/api/steward/coding/prepare': 'prepare', '/api/steward/coding/close': 'close',  '/api/steward/coding/review': 'review', '/api/steward/coding/approve': 'approveAndDispatch', '/api/steward/coding/reconcile': 'reconcile', '/api/steward/coding/observe': 'observe', '/api/steward/coding/release': 'release' };
       if (Object.hasOwn(codingActions, path)) {
         if (!steward.coding) throw new Error('CODING_NOT_ENABLED');
         return reply(await steward.coding[codingActions[path]](input));

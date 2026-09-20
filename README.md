@@ -42,8 +42,8 @@ Steward inference and hosted coding have separate accounting: inference uses a b
 
 ## Verification and limits
 
-The publication baseline passed 44 root tests and 53 hosted tests, independent review and a Vercel-output build. These establish local behavior, not general model quality or complete remote cancellation. CI repeats both suites and the hosted build. The first application coding run is pending; earlier synthetic experiments are not application completion evidence.
+The personal-pilot release passed 46 root tests and 87 hosted tests, independent review and a Vercel-output build. These establish local behavior, not general model quality or complete remote cancellation. CI repeats both suites and the hosted build. The first application coding loop completed and its changes are merged. Earlier synthetic experiments remain separately labeled.
 
-GitHub evidence is refreshed explicitly. Provider termination observations remain manual. No unattended result polling, paid fallback, automatic merge or automatic deployment is implemented. The repository instructions' original “Documentation only” setup paragraph is historical; the commands above are current.
+The personal pilot adds cumulative allowance controls, bounded assignment preparation, durable progress and authenticated GitHub monitoring with quiet Telegram updates. These require the operational setup in [personal-pilot.md](docs/personal-pilot.md). Provider termination confirmation and exact assignment approval remain manual. No paid fallback, automatic merge or automatic deployment is implemented. The repository instructions' original “Documentation only” setup paragraph is historical; the commands above are current.
 
 This public repository begins with a reviewed source snapshot. Private operational records and earlier local development history are intentionally excluded. A public synthetic experiment fixture and demo link remain as explicitly labeled historical examples, not live application results.

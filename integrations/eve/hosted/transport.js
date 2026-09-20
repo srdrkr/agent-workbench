@@ -28,7 +28,7 @@ export function hostedTransport({ store, requestId, inputDigest, sessionId, send
         || state.paused || state.model !== HOSTED_MODEL || !record || record.status !== 'thinking'
         || record.contextRevision !== state.project.revision || record.projectId !== state.project.id
         || !record.contextSnapshot?.sources?.every(s => s.exposure === 'model_allowed' && Date.parse(s.observedAt) <= Date.parse(now()) && Date.parse(s.expiresAt) > Date.parse(now()))
-        || (state.continuation && (state.continuation.contextRevision !== record.contextRevision || state.continuation.model !== state.model
+        || (state.continuation && !state.pilot && (state.continuation.contextRevision !== record.contextRevision || state.continuation.model !== state.model
           || !record.contextSnapshot.sources.some(s => s.id === state.continuation.source.id && s.revision === state.continuation.source.revision)))
         || record.inputDigest !== inputDigest || record.provider || !sessionId || bytes > 12000
         || state.reservedMicros + reserve > state.budgetMicros) throw new Error('HOSTED_PROVIDER_ADMISSION_DENIED');

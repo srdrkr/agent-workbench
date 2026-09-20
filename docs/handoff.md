@@ -6,4 +6,4 @@ Root tests use Node 22.22.0. Hosted tests/build use Node 24.21.0 and a lockfile-
 
 Use one writer per target and obtain independent review for behavior or authority changes. Preserve existing work. Do not treat a source file, task candidate or provider self-report as approval or verified execution. Live actions need the scoped owner-approved configuration outside this repository.
 
-First assignment: decisions history presentation in docs/current-work.md. Its coding partner should return a draft PR with exact checks and commit evidence. Owner merge and deployment follow separately.
+The first application assignment is complete. Read docs/current-work.md and docs/personal-pilot.md for current direction. Changes to the live Routine, connection verification, pilot allowance and scheduler are separate operational steps; source presence alone does not prove they are configured.

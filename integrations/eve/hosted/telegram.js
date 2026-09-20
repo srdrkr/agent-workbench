@@ -42,7 +42,7 @@ export class TelegramChannel {
       state.telegram ??= { binding: this.binding, updates: {} };
       if (state.telegram.binding !== this.binding) fail('TELEGRAM_BINDING_CHANGED');
       if (Object.hasOwn(state.telegram.updates, id)) return false;
-      if (Object.keys(state.telegram.updates).length >= 200) fail('TELEGRAM_PILOT_LIMIT');
+      if (Object.keys(state.telegram.updates).length >= (state.pilot ? 5000 : 200)) fail('TELEGRAM_PILOT_LIMIT');
       state.telegram.updates[id] = { id, messageId: m.message_id, status: 'accepted', receivedAt: this.now(), projectId: state.project.id, contextRevision: state.project.revision };
       return true;
     });
@@ -90,4 +90,16 @@ export class TelegramChannel {
     } catch { /* Never persist raw URL/error: it can contain the bot token. */ }
     await this.store.change(state => { const update = state.telegram.updates[id]; update.status = messageId ? 'sent' : 'delivery_unknown'; update.observedAt = this.now(); if (messageId) update.sentMessageId = messageId; });
   }
+}
+
+export async function sendProgressNotification(config, job, send = fetch) {
+  const labels = { tested_draft_pr: 'Draft PR ready: required checks passed', merged_pr: 'PR merged',
+    needs_review: 'Coding result needs review', branch_without_pr: 'Claude pushed a branch; no matching PR yet',
+    conflicting_prs: 'More than one PR matches this task', not_found: 'No matching GitHub result yet' };
+  const text = `${labels[job.result?.result] ?? 'Coding progress changed'}\n${job.spec.objective.slice(0, 400)}\n${job.result?.prUrl ?? ''}\n${job.releasedAt ? 'Coding run closed.' : 'Claude session completion still needs confirmation in Steward.'}\n\nReview: ${config.origin}`;
+  const result = await send(`https://api.telegram.org/bot${config.token}/sendMessage`, { method: 'POST',
+    headers: { 'content-type': 'application/json' }, body: JSON.stringify({ chat_id: config.chatId, text,
+      link_preview_options: { is_disabled: true } }), redirect: 'error', signal: AbortSignal.timeout(10000) });
+  const body = await result.json();
+  return result.ok && body.ok === true && positiveId(body.result?.message_id) && body.result.chat?.id === config.chatId;
 }
