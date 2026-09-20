@@ -78,12 +78,15 @@ test('repeatable assignment fixes connection authority and dispatches only after
   const coding = new HostedCoding(f.store, { now: f.now, config: { spec, repeatable: true, verifiedUntil: '2026-09-20T12:00:00Z', token: 'test-secret' },
     read: async path => path.includes('/commits/') ? { sha: 'a'.repeat(40) } : { full_name: spec.repository, private: false, default_branch: spec.baseBranch },
     send: async () => { fires++; return { outcome: 'unknown' }; } });
-  const draft = { objective: 'Improve controls', acceptance: 'Clear action and passing checks', allowedPaths: ['src/ui.js'], expectedContextRevision: (await f.store.read()).project.revision, repository: 'attacker/repo', routineId: 'trig_ATTACK' };
+  const draft = { requestId: 'assignment-one', objective: 'Improve controls', acceptance: 'Clear action and passing checks', allowedPaths: ['src/ui.js'], expectedContextRevision: (await f.store.read()).project.revision, repository: 'attacker/repo', routineId: 'trig_ATTACK' };
   const review = await coding.prepare(draft); assert.equal(fires, 0);
+  const duplicate = await coding.prepare(draft); assert.equal(duplicate.requestId, review.requestId);
+  assert.equal(Object.keys((await f.store.read()).requests).length, 1);
+  await assert.rejects(coding.prepare({ ...draft, objective: 'Changed task' }), /CONFLICT/);
   assert.equal(review.spec.repository, spec.repository); assert.equal(review.spec.routineId, spec.routineId); assert.deepEqual(review.spec.requiredChecks, spec.requiredChecks); assert.equal(review.spec.baseSha, 'a'.repeat(40));
   await assert.rejects(coding.approveAndDispatch({ ...review, reviewHash: 'tampered' }), /MISMATCH/);
   await coding.approveAndDispatch(review); await coding.approveAndDispatch(review); assert.equal(fires, 1);
-  await assert.rejects(coding.prepare(draft), /PAUSED/);
+  await assert.rejects(coding.prepare({ ...draft, requestId: 'another-assignment' }), /PAUSED/);
 });
 
 test('monitor is model-free, debounces concurrent calls and never repeats uncertain notification delivery', async t => {

@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { validatedSpec } from '../../../src/task-policy.js';
 import { fireRoutine, repositoryPreflight, collectEvidence, githubReader, sessionReference } from '../../../src/providers.js';
 const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
@@ -48,25 +48,34 @@ export class HostedCoding {
     return ['repository', 'visibility', 'routineId', 'baseBranch', 'mode'].every(k => spec[k] === fixed[k])
       && hash(spec.requiredChecks) === hash(fixed.requiredChecks);
   }
-  async prepare({ objective, acceptance, allowedPaths, expectedContextRevision }) {
+  async prepare({ requestId, fromRequestId, objective, acceptance, allowedPaths, expectedContextRevision }) {
     need(this.enabled() && this.config.repeatable, 'CODING_NOT_ENABLED');
+    need(typeof requestId === 'string' && /^[a-z0-9][a-z0-9-]{0,63}$/.test(requestId) && (fromRequestId === undefined || typeof fromRequestId === 'string'), 'INVALID_REQUEST');
+    const draftHash = hash({ objective, acceptance, allowedPaths, expectedContextRevision, fromRequestId });
+    const previous = own((await this.store.read()).requests, requestId);
+    if (previous) { need(previous.source === 'authenticated_owner_assignment' && previous.draftHash === draftHash, 'REQUEST_ID_CONFLICT'); return this.review({ requestId, proposalHash: previous.proposalHash }); }
     const base = await this.read(`/repos/${this.config.spec.repository}/commits/${this.config.spec.baseBranch}`);
-    const id = randomUUID();
+    const id = requestId;
     let spec;
-    try { spec = validatedSpec({ ...this.config.spec, taskId: `task-${id.slice(0, 18)}`, baseSha: base.sha,
+    try { spec = validatedSpec({ ...this.config.spec, taskId: `task-${hash(id).slice(0, 24)}`, baseSha: base.sha,
       objective, acceptance, allowedPaths }); } catch { throw new Error('INVALID_REQUEST'); }
     await repositoryPreflight(spec, this.read).catch(() => { throw new Error('CODING_PREFLIGHT_FAILED'); });
     const record = await this.store.change(state => {
+      const existing = own(state.requests, id);
+      if (existing) { need(existing.source === 'authenticated_owner_assignment' && existing.draftHash === draftHash, 'REQUEST_ID_CONFLICT'); return existing; }
+      const source = fromRequestId === undefined ? null : own(state.requests, fromRequestId);
+      if (fromRequestId !== undefined) need(source?.proposal?.kind === 'plan' && source.status === 'awaiting_approval' && source.contextRevision === state.project.revision, 'APPROVAL_MISMATCH');
       need(state.pilot && state.project.revision === expectedContextRevision && fresh(state.project, this.now()), 'APPROVAL_MISMATCH');
       need(!state.paused && !control(state).paused && !unresolved(control(state)) && Object.keys(state.requests).length < 500, 'CODING_ADMISSION_PAUSED');
       const project = structuredClone(state.project);
       project.codingCandidates = [{ id: spec.taskId, title: objective.slice(0, 160), sourceIds: [project.sources[0].id], spec }];
       const proposal = { kind: 'coding', candidateId: spec.taskId, title: objective.slice(0, 240), rationale: acceptance.slice(0, 2000), citations: [project.sources[0].id], question: null };
-      const record = { id, source: 'authenticated_owner_assignment', projectId: state.project.id,
+      const record = { id, draftHash, ...(fromRequestId ? { fromRequestId } : {}), source: 'authenticated_owner_assignment', projectId: state.project.id,
         message: 'Owner prepared a coding assignment', contextRevision: state.project.revision, contextSnapshot: project,
         status: 'awaiting_approval', createdAt: this.now(), proposal,
         proposalHash: hash({ projectId: state.project.id, contextRevision: state.project.revision, proposal }) };
       state.requests[id] = record;
+      if (source) { source.status = 'assignment_prepared'; source.assignmentRequestId = id; }
       event(state, 'coding_assignment_prepared', { requestId: id, scopeHash: hash(spec) }, this.now()); return record;
     });
     return this.review({ requestId: record.id, proposalHash: record.proposalHash });
