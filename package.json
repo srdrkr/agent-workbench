@@ -1,0 +1,15 @@
+{
+  "name": "agent-workbench",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22.22.0" },
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "demo": "node src/demo.js",
+    "probe": "node src/cli.js",
+    "steward": "node src/steward-server.js",
+    "steward:open": "node src/steward-open.js",
+    "check": "node --check src/cli.js && node --check src/probe.js && node --check src/providers.js && node --check src/demo.js && node --check src/steward.js && node --check src/steward-server.js && node --check src/steward-demo.js && node --check src/steward-open.js && node --check web/app.js && git diff --check"
+  }
+}

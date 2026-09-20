@@ -1,0 +1,11 @@
+# Hosted configuration
+
+Deploy the Nuxt/Eve package from `integrations/eve` with the shared `src` policy/transport files available two directories above it. Use Node 24.x. CI builds without production credentials; deployment is a separate owner action.
+
+Configure a private PostgreSQL database, exact HTTPS `APP_ORIGIN`, `BETTER_AUTH_SECRET`, `WORKBENCH_OWNER_EMAIL`, stable workspace key `WORKBENCH_PROJECT_ID`, server-only `WORKBENCH_EVE_ACCESS_TOKEN`, `WORKBENCH_EVE_MODE=hosted`, `WORKBENCH_EVE_GATEWAY_APPROVED=yes`, and a bounded private `AI_GATEWAY_API_KEY`. Disable content tracing/telemetry with `EVE_TRACES_CONTENT=off` and `EVE_TELEMETRY_DISABLED=1`. Bootstrap via `npm run hosted:setup` only for a new workspace; existing state is deliberately rejected. Read the setup script's validated inputs before use. Never commit or print secrets.
+
+After login, **Update project brief** accepts pasted text or a `.md`/`.txt` file (4,000 characters, file up to 16 KB). Preview the exact content, then approve. Preview makes no model call; approved content may be sent to Eve and the configured model with future questions. Ordinary chat does not replace the brief. The simple form clears coding candidates. Use the authenticated structured preview/apply API for an operator-prepared project with a fixed coding candidate. Do not change the stable workspace key to reset accounting.
+
+Coding defaults off. A verified configuration requires `WORKBENCH_CODING_ENABLED=yes`, validated live JSON `WORKBENCH_CODING_SPEC`, `WORKBENCH_CODING_VERIFIED_UNTIL`, `WORKBENCH_CODING_OVERAGE_DISABLED=yes`, private `WORKBENCH_ROUTINE_TOKEN` and `WORKBENCH_GITHUB_READ_TOKEN`. The approved project candidate must exactly match that spec. Inspect the routine/repository/base/check identities, model availability and no-overage account state first. Never place trigger credentials in the routine's environment or assignment text.
+
+The coding approval records one intent before firing; duplicate requests and unknown results cannot fire again. Refresh GitHub evidence explicitly. A slot releases only after a matching provider termination observation followed by fresh evidence collection. Pause is local admission control, not remote cancellation. There is no automatic poller or result notification yet.

@@ -1,0 +1,10 @@
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+auth.json
+.runtime/
+.local/
+node_modules/
+*.log

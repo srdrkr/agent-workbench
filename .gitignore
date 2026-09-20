@@ -1,0 +1,34 @@
+# Local secrets and provider state
+.env
+.env.*
+!.env.example
+!.env.template
+*.pem
+*.key
+auth.json
+credentials.json
+.vercel/
+.claude/settings.local.json
+
+# Private runtime state; committed eval fixtures must be synthetic
+.runtime/
+.local/
+traces/
+*.log
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+
+# Generated dependencies, builds, and worktrees
+node_modules/
+dist/
+coverage/
+.nuxt/
+.output/
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.worktrees/
+.DS_Store

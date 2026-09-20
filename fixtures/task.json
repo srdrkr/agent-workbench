@@ -1,0 +1,13 @@
+{
+  "taskId": "slug-001",
+  "repository": "example-owner/workbench-routine-sandbox",
+  "visibility": "public",
+  "routineId": "trig_SYNTHETIC",
+  "baseBranch": "main",
+  "baseSha": "1111111111111111111111111111111111111111",
+  "objective": "Make slug normalize leading/trailing whitespace and collapse runs of spaces or hyphens into one hyphen.",
+  "acceptance": "Pass node --test, including the prewritten whitespace cases. Change only slug.js; preserve the tests and workflow. Open one draft PR with the task marker, exact head commit, actual test results and any limitations. Stop on a changed base revision.",
+  "allowedPaths": ["slug.js"],
+  "requiredChecks": [{ "name": "test", "appId": 15368 }],
+  "mode": "synthetic"
+}

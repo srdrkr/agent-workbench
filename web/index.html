@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Project Steward · Agent Workbench</title><link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script></head>
+<body>
+  <header><a class="wordmark" href="/">AW<span>Agent Workbench</span></a><span class="pill">LOCAL PREVIEW</span></header>
+  <main>
+    <div class="heading"><div><p class="eyebrow">ONE PROJECT. ONE USEFUL NEXT STEP.</p><h1>Project Steward</h1><p class="intro">Keep the work moving, with the reason and the evidence in view.</p></div><button id="refresh" class="quiet">Refresh</button></div>
+    <p id="notice" role="status" aria-live="polite"></p>
+    <section id="login" hidden class="panel"><h2>Open your local owner session</h2><p>In a second terminal, run <code>npm run steward:open</code>. The app signs you in locally without putting credentials in a URL or asking you to paste a key.</p></section>
+    <div id="workspace" hidden>
+      <div class="layout">
+        <section class="primary">
+          <section class="panel brief"><div class="section-label"><span>PROJECT CONTEXT</span><span id="freshness" class="pill"></span></div><h2 id="project-name"></h2><p id="objective"></p><details><summary>Sources &amp; scope</summary><div id="sources"></div></details></section>
+          <section class="panel composer"><h2>What needs attention?</h2><p class="muted" id="mode"></p><div class="suggestions"><button data-prompt="What is the most useful next step?">Choose the next step</button><button data-prompt="Keep Friday’s outcome review visible as a commitment.">Keep a commitment</button><button data-prompt="What is blocking the project?">Check the blocker</button></div><form id="request-form"><label class="sr-only" for="message">Your request</label><textarea id="message" maxlength="2000" required placeholder="Ask for a next step, add a commitment, or clarify a blocker…"></textarea><div class="compose-footer"><span>Suggestions become actions only with your approval.</span><button type="submit" id="send">Ask Steward <span aria-hidden="true">↗</span></button></div></form></section>
+          <section><div class="section-label"><h2>Decisions &amp; work</h2><span id="request-count"></span></div><div id="requests"></div></section>
+        </section>
+        <aside>
+          <section class="panel"><div class="section-label"><span>FOLLOW-THROUGH</span><span class="dot"></span></div><h2>Approved commitments</h2><div id="commitments"></div></section>
+          <section class="panel"><div class="section-label"><span>CODING CONTROL</span></div><h2 id="admission"></h2><p class="muted">One assignment at a time. An uncertain dispatch stays held until reconciled and completion is observed.</p><button id="stop" class="quiet full">Pause new dispatch</button><p class="small">This pauses local admission. It does not stop an active Claude session. Active cancellation is manual and remains untested.</p></section>
+          <section class="panel evidence"><div class="section-label"><span>OBSERVED IN THE REAL RUN</span><span class="pill green">MERGED</span></div><h2>First coding loop</h2><div id="observed"></div></section>
+        </aside>
+      </div>
+      <footer>Private local state · Eve is the model path · Claude Routines is the coding path <button id="logout" class="text-button">Sign out</button></footer>
+    </div>
+  </main>
+</body>
+</html>

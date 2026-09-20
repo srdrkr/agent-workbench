@@ -1,0 +1,13 @@
+{
+  "id": "link-quality",
+  "name": "Help centre links",
+  "objective": "Make generated help-centre links predictable. Finish the known normalization defect before taking on new features.",
+  "sources": [
+    { "id": "brief", "title": "Synthetic project brief", "revision": "demo-1", "observedAt": "2026-09-17T00:00:00Z", "expiresAt": "2030-01-01T00:00:00Z", "exposure": "model_allowed", "content": "This is a synthetic scenario, not a real connected project. Current priority: normalize pasted whitespace in link slugs. Do not change the publishing workflow or introduce dependencies. Owner review is needed before coding." },
+    { "id": "acceptance", "title": "Normalization acceptance", "revision": "demo-1", "observedAt": "2026-09-17T00:00:00Z", "expiresAt": "2030-01-01T00:00:00Z", "exposure": "model_allowed", "content": "The existing test covers leading/trailing whitespace and repeated spaces or hyphens. Only slug.js may change. Passing tests and a draft PR are the completion evidence. Review the outcome before choosing another feature." }
+  ],
+  "codingCandidates": [{
+    "id": "normalize", "title": "Fix whitespace in generated links", "sourceIds": ["brief", "acceptance"],
+    "spec": { "taskId": "demo-normalize", "repository": "example-owner/workbench-routine-sandbox", "visibility": "public", "routineId": "trig_SYNTHETIC", "baseBranch": "main", "baseSha": "1111111111111111111111111111111111111111", "objective": "Trim whitespace and collapse runs of spaces or hyphens in generated slugs.", "acceptance": "Pass the existing node --test checks. Change only slug.js. Return a draft PR with exact commit and test evidence.", "allowedPaths": ["slug.js"], "requiredChecks": [{ "name": "test", "appId": 15368 }], "mode": "synthetic" }
+  }]
+}

@@ -1,0 +1,31 @@
+{
+  "name": "workbench-eve-judge",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "engines": {
+    "node": "24.x"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "fixture": "node start-fixture.js",
+    "eval:gateway": "node eval-gateway.js",
+    "dev": "EVE_TELEMETRY_DISABLED=1 EVE_TRACES_CONTENT=off eve dev --no-ui --host 127.0.0.1 --port 2000",
+    "build": "EVE_TELEMETRY_DISABLED=1 EVE_TRACES_CONTENT=off eve build",
+    "dev:hosted": "EVE_TELEMETRY_DISABLED=1 EVE_TRACES_CONTENT=off nuxt dev",
+    "build:hosted": "EVE_TELEMETRY_DISABLED=1 EVE_TRACES_CONTENT=off nuxt build",
+    "hosted:setup": "node scripts/hosted-setup.js"
+  },
+  "dependencies": {
+    "@vercel/functions": "3.9.8",
+    "ai": "7.0.85",
+    "better-auth": "1.7.5",
+    "eve": "0.47.3",
+    "nuxt": "4.5.2",
+    "pg": "8.23.0",
+    "zod": "4.5.4"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "0.5.8"
+  }
+}

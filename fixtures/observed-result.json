@@ -1,0 +1,12 @@
+{
+  "label": "First real coding run",
+  "source": "GitHub API observation, September 17, 2026",
+  "repository": "srdrkr/workbench-routine-sandbox",
+  "prUrl": "https://github.com/srdrkr/workbench-routine-sandbox/pull/1",
+  "headSha": "f9b0bf7a5cc95104b4165e48f73be9e050198eeb",
+  "mergeSha": "86bfe480ffdf6e25ec2bbef75baef2de927bb810",
+  "mergedAt": "2026-09-17T20:38:41Z",
+  "checks": "Two independent GitHub Actions checks passed at the observed head before merge.",
+  "dispatch": "One fire; unexpected HTTP 200 retained as unknown. Completion recovered without retry.",
+  "limits": "Laptop-off and active cancellation tests remain deferred. Routine paused; original authorization consumed."
+}

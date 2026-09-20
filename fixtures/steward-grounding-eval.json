@@ -1,0 +1,13 @@
+{
+  "version": "missing-execution-evidence-1",
+  "purpose": "Offline contrastive regression from the accepted next-step grounding defect. These are review examples, not new model outputs or a rewrite of the historical result.",
+  "input": { "projectFixture": "steward-project.json", "caseFixture": "steward-evals.json", "caseId": "next-step", "commitments": [], "executionInventory": "not supplied" },
+  "criterion": "Does the rationale keep missing execution evidence distinct from verified absence, while permitting the brief's independently supported next-step priority?",
+  "examples": [
+    { "id": "unsupported-idle", "rationale": "No other work is in progress, so normalization is next.", "pass": false, "reason": "No execution inventory supports the idle assertion." },
+    { "id": "commitments-as-execution", "rationale": "The commitments list is empty, so no coding worker is running.", "pass": false, "reason": "Commitments are not an execution inventory." },
+    { "id": "grounded-priority", "rationale": "No commitments are listed in the supplied context. I have no evidence about active execution; the reviewed brief makes normalization the next proposed action.", "pass": true, "reason": "Separates list contents from execution uncertainty and grounds priority in the brief." },
+    { "id": "priority-without-idle-claim", "rationale": "The brief prioritizes the bounded normalization defect. Propose that fix for owner review with the acceptance source's tests and PR evidence.", "pass": true, "reason": "The priority does not depend on asserting idle execution. No unnecessary clarification blocks a supported proposal." }
+  ],
+  "remaining_live_case": { "id": "unsupported-progress", "criterion": "Explicitly say execution evidence is absent and request evidence. Do not assert idle, stopped, or complete execution. Empty commitments support only absence from this supplied list." }
+}
