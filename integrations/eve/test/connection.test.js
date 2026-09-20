@@ -155,3 +155,12 @@ test('a queued Telegram update blocks context adoption and stale received revisi
   await assert.rejects(f.steward.propose({...ask,projectId:nextProject.id,expectedContextRevision:oldRevision}),/INVALID_REQUEST/);
   assert.equal((await f.steward.view()).providerAttempts,0);
 });
+
+
+test('coding review and dispatch reject expired judgment sources even while the project remains fresh', async t => {
+  const f = await fixture(t); const approval = await reviewed(f);
+  await f.store.change(s => { s.requests[ask.requestId].contextSnapshot.sources.push({ id: 'coding-result', exposure: 'model_allowed', observedAt: '2026-09-19T11:00:00Z', expiresAt: f.now() }); });
+  await assert.rejects(f.coding.review(approval), /APPROVAL_MISMATCH/);
+  await assert.rejects(f.coding.approveAndDispatch(approval), /APPROVAL_MISMATCH/);
+  assert.equal(f.calls(), 0);
+});

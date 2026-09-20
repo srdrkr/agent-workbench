@@ -120,7 +120,7 @@ test('real Better Auth rejects public signup, wrong password, foreign owner and 
   const cookie = login.headers.getSetCookie().map(v => v.split(';')[0]).join('; '); assert.ok(cookie);
   assert.equal((await handle(req('/api/steward/state', undefined, cookie))).status, 200);
   assert.equal((await handle(req('/api/steward/propose', ask, cookie, 'https://evil.example'))).status, 403);
-  for (const path of ['/api/steward/context/preview', '/api/steward/context/apply', '/api/steward/coding/review', '/api/steward/coding/approve', '/api/steward/coding/reconcile', '/api/steward/coding/observe', '/api/steward/coding/release']) {
+  for (const path of ['/api/steward/continuation/review', '/api/steward/continuation/approve', '/api/steward/context/preview', '/api/steward/context/apply', '/api/steward/coding/review', '/api/steward/coding/approve', '/api/steward/coding/reconcile', '/api/steward/coding/observe', '/api/steward/coding/release']) {
     assert.equal((await handle(req(path, {}))).status, 401);
     assert.equal((await handle(req(path, {}, cookie, 'https://evil.example'))).status, 403);
   }
