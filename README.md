@@ -46,4 +46,4 @@ The publication baseline passed 44 root tests and 53 hosted tests, independent r
 
 GitHub evidence is refreshed explicitly. Provider termination observations remain manual. No unattended result polling, paid fallback, automatic merge or automatic deployment is implemented. The repository instructions' original “Documentation only” setup paragraph is historical; the commands above are current.
 
-This public repository begins with a reviewed source snapshot. Private operational records and earlier local development history are intentionally excluded.
+This public repository begins with a reviewed source snapshot. Private operational records and earlier local development history are intentionally excluded. A public synthetic experiment fixture and demo link remain as explicitly labeled historical examples, not live application results.
