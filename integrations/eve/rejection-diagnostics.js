@@ -24,11 +24,29 @@ function requestIdentifier(headers, body) {
   if (typeof body?.generationId === 'string' && /^gen_[A-Za-z0-9]{8,80}$/.test(body.generationId)) {
     return { source: 'generationId', value: body.generationId };
   }
+  const nested = body?.providerMetadata?.gateway?.generationId;
+  if (typeof nested === 'string' && /^gen_[A-Za-z0-9]{8,80}$/.test(nested)) return { source: 'providerMetadata.gateway.generationId', value: nested };
   return null;
 }
 
+function providerDiagnostics(body) {
+  const result = {};
+  if (body?.error?.details?.error_code === 'enforced_spend_limit_reached') result.providerErrorCode = 'enforced_spend_limit_reached';
+  const gateway = body?.providerMetadata?.gateway;
+  if (typeof gateway?.generationId === 'string' && /^gen_[A-Za-z0-9]{8,80}$/.test(gateway.generationId)) result.gatewayGenerationId = gateway.generationId;
+  const models = gateway?.routing?.modelAttempts;
+  if (!Array.isArray(models) || models.length > 3) return result;
+  const attempts = models.flatMap(model => Array.isArray(model?.providerAttempts) && model.providerAttempts.length <= 3 ? model.providerAttempts : []);
+  const errors = attempts.filter(a => a?.provider === 'anthropic' && a.success === false && Number.isInteger(a.statusCode) && a.statusCode >= 400 && a.statusCode <= 599)
+    .map(a => ({ provider: 'anthropic', statusCode: a.statusCode,
+      ...(a.error === 'Service temporarily unavailable' ? { category: 'service_unavailable' } : {}) }));
+  if (errors.length) result.providerErrors = errors;
+  return result;
+}
+
 /** Consume, never clone, a rejection body. Bound bytes and time, discard on any
- * parsing failure, and never retain prose, arbitrary headers, or nested errors. */
+ * parsing failure. Retain only selected typed fields from nested routing errors,
+ * never arbitrary provider prose, credentials, or request/response payloads. */
 export async function rejectionDiagnostics(response) {
   let body;
   let timer;
@@ -59,5 +77,6 @@ export async function rejectionDiagnostics(response) {
   }
   const category = [body?.error?.type, body?.error?.code].find(value => categories.has(value)) ?? null;
   return { httpStatus: response.status, errorCategory: category,
-    requestIdentifier: requestIdentifier(response.headers, body), retryAfter: parseRetryAfter(response.headers.get('retry-after')) };
+    requestIdentifier: requestIdentifier(response.headers, body), retryAfter: parseRetryAfter(response.headers.get('retry-after')),
+    ...providerDiagnostics(body) };
 }

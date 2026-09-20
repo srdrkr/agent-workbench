@@ -171,3 +171,91 @@ test('hosted pilot cannot start a sixth admitted model attempt', async t => {
   await assert.rejects(steward.propose({ ...ask, requestId: 'request-six' }), /ADMISSION_PAUSED/);
   assert.equal(Object.keys((await store.read()).requests).length, 5);
 });
+
+async function rejectedFixture(t) {
+  const f = await fixture(t, async () => undefined);
+  await f.steward.propose(ask);
+  await f.store.change(s => { Object.assign(s.requests[ask.requestId].provider, { httpStatus: 429, rejection: { httpStatus: 429, errorCategory: 'rate_limit_exceeded', retryAfter: null } }); });
+  const r = (await f.steward.view()).requests[0];
+  const recovery = { ...ask, requestId: 'retry-one', expectedContextRevision: r.contextRevision, retryOf: r.id, rejectionHash: r.retryReviewHash };
+  let sends = 0;
+  const steward = new HostedSteward(f.store, async input => {
+    await hostedTransport({ store: f.store, requestId: input.hostedRequestId, inputDigest: digest(input), sessionId: 'retry-session', now, send: async () => { sends++; return new Response('synthetic', { status: 200 }); } })(endpoint, wire());
+    return proposal;
+  }, { now });
+  return { ...f, steward, recovery, sends: () => sends };
+}
+
+test('explicit rejection recovery keeps old evidence and accounting, admits one new request, and never replays', async t => {
+  const f = await rejectedFixture(t); const before = await f.store.read();
+  const [a, b] = await Promise.all([f.steward.propose(f.recovery), f.steward.propose(f.recovery)]);
+  assert.ok([a, b].some(r => r.status === 'awaiting_approval'));
+  assert.equal(f.sends(), 1);
+  const after = await f.store.read();
+  assert.deepEqual(after.requests[ask.requestId], { ...before.requests[ask.requestId], retryRequestId: 'retry-one' });
+  assert.equal(after.requests['retry-one'].retryOf, ask.requestId);
+  assert.equal(after.reservedMicros, before.reservedMicros + after.requests['retry-one'].provider.reservedMicros);
+  const restarted = new HostedSteward(f.store, () => { throw Error('must never send'); }, { now });
+  assert.equal((await restarted.propose(f.recovery)).status, 'awaiting_approval');
+  await assert.rejects(restarted.propose({ ...f.recovery, requestId: 'retry-two' }), /RETRY_REVIEW_MISMATCH/);
+  await assert.rejects(restarted.propose({ ...ask, requestId: 'retry-one' }), /REQUEST_ID_CONFLICT/);
+  assert.equal((await restarted.view()).requests.find(r => r.id === ask.requestId).retryReviewHash, null);
+});
+
+test('retry review binds request, context, model and rejection evidence', async t => {
+  for (const change of [r => { r.message = 'Changed request'; }, r => { r.rejectionHash = 'a'.repeat(64); }, r => { delete r.expectedContextRevision; }, r => { r.retryOf = 'missing'; }]) {
+    const f = await rejectedFixture(t); change(f.recovery);
+    await assert.rejects(f.steward.propose(f.recovery), /RETRY_REVIEW_MISMATCH/); assert.equal(f.sends(), 0);
+  }
+  for (const change of [s => { s.model = 'different-model'; }, s => { s.project.revision = 'changed'; }, s => { s.requests[ask.requestId].provider.rejection.retryAfter = { kind: 'seconds', seconds: 30 }; }]) {
+    const f = await rejectedFixture(t); await f.store.change(change);
+    await assert.rejects(f.steward.propose(f.recovery), /RETRY_REVIEW_MISMATCH|INVALID_REQUEST/); assert.equal(f.sends(), 0);
+  }
+});
+
+test('unknown, invalid-success, spend-cap and in-flight failures cannot become retry approvals', async t => {
+  for (const change of [r => { delete r.provider.httpStatus; }, r => { r.provider.httpStatus = 200; }, r => { r.status = 'thinking'; }, r => { delete r.completedAt; }, r => { r.provider.rejection.providerErrorCode = 'enforced_spend_limit_reached'; }, r => { r.provider.rejection.errorCategory = null; }]) {
+    const f = await rejectedFixture(t); await f.store.change(s => change(s.requests[ask.requestId]));
+    assert.equal((await f.steward.view()).requests[0].retryReviewHash, null);
+    await assert.rejects(f.steward.propose(f.recovery), /RETRY_REVIEW_MISMATCH/); assert.equal(f.sends(), 0);
+  }
+});
+
+test('recovery respects Retry-After and cannot bypass another unresolved request, pause, attempt cap, expiry or budget', async t => {
+  for (const [change, expected] of [
+    [s => { s.paused = true; }, /ADMISSION_PAUSED/],
+    [s => { s.project.sources[0].expiresAt = '2026-09-18T00:00:00Z'; }, /CONTEXT_EXPIRED/],
+    [s => { s.requests.other = { id: 'other', status: 'held' }; }, /UNRESOLVED_MODEL_ATTEMPT/],
+    [s => { for (let i = 0; i < 4; i++) s.requests[`prior-${i}`] = { id: `prior-${i}`, status: 'approved', provider: { intentAt: now() } }; }, /ADMISSION_PAUSED/],
+  ]) {
+    const f = await rejectedFixture(t); await f.store.change(change);
+    await assert.rejects(f.steward.propose(f.recovery), expected); assert.equal(f.sends(), 0);
+  }
+  for (const after of [{ kind: 'seconds', seconds: 30 }, { kind: 'date', at: '2026-09-19T13:00:00Z' }]) {
+    const f = await rejectedFixture(t); await f.store.change(s => { s.requests[ask.requestId].provider.rejection.retryAfter = after; });
+    f.recovery.rejectionHash = (await f.steward.view()).requests[0].retryReviewHash;
+    await assert.rejects(f.steward.propose(f.recovery), /RETRY_NOT_READY/); assert.equal(f.sends(), 0);
+  }
+  const f = await rejectedFixture(t); await f.store.change(s => { s.budgetMicros = s.reservedMicros; });
+  assert.equal((await f.steward.propose(f.recovery)).status, 'held'); assert.equal(f.sends(), 0);
+  assert.equal((await f.store.read()).reservedMicros, 1);
+});
+
+test('competing retry IDs cannot consume the same rejection twice', async t => {
+  const f = await rejectedFixture(t);
+  const results = await Promise.allSettled([f.steward.propose(f.recovery), f.steward.propose({ ...f.recovery, requestId: 'retry-competing' })]);
+  assert.equal(results.filter(r => r.status === 'fulfilled').length, 1);
+  assert.equal(results.filter(r => r.status === 'rejected' && /RETRY_REVIEW_MISMATCH/.test(r.reason.message)).length, 1);
+  assert.equal(f.sends(), 1);
+});
+
+test('a rejected recovery remains held and cannot chain or trigger automatic attempts', async t => {
+  const f = await rejectedFixture(t); let sends = 0;
+  const steward = new HostedSteward(f.store, async input => hostedTransport({ store: f.store, requestId: input.hostedRequestId,
+    inputDigest: digest(input), sessionId: 'rejected-retry', now, send: async () => { sends++; return new Response('{"error":{"type":"rate_limit_exceeded"}}', { status: 429 }); } })(endpoint, wire()), { now });
+  assert.equal((await steward.propose(f.recovery)).status, 'held');
+  assert.equal((await steward.propose(f.recovery)).status, 'held'); assert.equal(sends, 1);
+  const child = (await steward.view()).requests.find(r => r.id === 'retry-one');
+  await assert.rejects(steward.propose({ ...f.recovery, requestId: 'retry-again', retryOf: child.id, rejectionHash: child.retryReviewHash }), /UNRESOLVED_MODEL_ATTEMPT/);
+  assert.equal(sends, 1);
+});

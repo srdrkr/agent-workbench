@@ -95,3 +95,22 @@ test('SDK rejection diagnostics survive sanitization and restart; one admission 
     assert.ok(!readFileSync(path).includes(Buffer.from('PRIVATE_')));
   } finally { db.close(); await rm(dir, { recursive: true, force: true }); }
 });
+
+test('nested Gateway correlation and upstream status survive without provider prose or credentials', async () => {
+  const gateway = { generationId: 'gen_SyntheticRouting12345678', routing: { modelAttempts: [{
+    canonicalSlug: 'PRIVATE_MODEL', providerAttempts: [
+      { provider: 'anthropic', success: false, statusCode: 503, error: 'Service temporarily unavailable', credential: 'PRIVATE_KEY' },
+      { provider: 'anthropic', success: false, statusCode: 429, error: 'PRIVATE_PROVIDER_MESSAGE' },
+      { provider: 'PRIVATE_PROVIDER', success: false, statusCode: 503, error: 'PRIVATE_ERROR' },
+    ],
+  }] } };
+  const result = await rejectionDiagnostics(new Response(JSON.stringify({ error: { type: 'rate_limit_exceeded', message: 'PRIVATE_BODY' }, providerMetadata: { gateway } }), { status: 429 }));
+  assert.deepEqual(result.requestIdentifier, { source: 'providerMetadata.gateway.generationId', value: gateway.generationId });
+  assert.equal(result.gatewayGenerationId, gateway.generationId);
+  assert.deepEqual(result.providerErrors, [{ provider: 'anthropic', statusCode: 503, category: 'service_unavailable' }, { provider: 'anthropic', statusCode: 429 }]);
+  assert.ok(!JSON.stringify(result).includes('PRIVATE_'));
+  const budget = await rejectionDiagnostics(new Response(JSON.stringify({ error: { type: 'rate_limit_error', details: { error_code: 'enforced_spend_limit_reached', secret: 'PRIVATE' } } }), { status: 429 }));
+  assert.equal(budget.providerErrorCode, 'enforced_spend_limit_reached');
+  const hostile = await rejectionDiagnostics(new Response(JSON.stringify({ error: { details: { error_code: 'PRIVATE' } }, providerMetadata: { gateway: { generationId: 'PRIVATE', routing: { modelAttempts: [{ providerAttempts: [{ provider: 'anthropic', success: false, statusCode: '503', error: 'PRIVATE' }] }] } } } }), { status: 429 }));
+  assert.equal(hostile.providerErrors, undefined); assert.equal(hostile.gatewayGenerationId, undefined); assert.equal(hostile.providerErrorCode, undefined);
+});
