@@ -124,6 +124,15 @@ test('coding configuration is disabled by default and rejects absent no-overage 
   assert.equal(codingConfig({}),null);assert.throws(()=>codingConfig({WORKBENCH_CODING_ENABLED:'yes'}),/INVALID/);
 });
 
+test('public evidence needs no account token while private repositories require one',()=>{
+  const env={WORKBENCH_CODING_ENABLED:'yes',WORKBENCH_CODING_SPEC:JSON.stringify(spec),
+    WORKBENCH_CODING_VERIFIED_UNTIL:config.verifiedUntil,WORKBENCH_CODING_OVERAGE_DISABLED:'yes',WORKBENCH_ROUTINE_TOKEN:config.token};
+  assert.equal(codingConfig(env).githubToken,undefined);
+  env.WORKBENCH_CODING_SPEC=JSON.stringify({...spec,visibility:'private'});
+  assert.throws(()=>codingConfig(env),/INVALID/);
+  assert.equal(codingConfig({...env,WORKBENCH_GITHUB_READ_TOKEN:'synthetic-read-token'}).githubToken,'synthetic-read-token');
+});
+
 
 test('a later running observation reclaims a released slot and blocks context changes', async t => {
   const f=await fixture(t);const approval=await reviewed(f);await f.coding.approveAndDispatch(approval);
