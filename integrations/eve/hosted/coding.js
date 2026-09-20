@@ -18,7 +18,7 @@ export function codingConfig(env = process.env) {
     need(spec.mode === 'live' && env.WORKBENCH_CODING_OVERAGE_DISABLED === 'yes'
       && Number.isFinite(Date.parse(verifiedUntil)) && typeof env.WORKBENCH_ROUTINE_TOKEN === 'string'
       && env.WORKBENCH_ROUTINE_TOKEN.length >= 20 && !/\s/.test(env.WORKBENCH_ROUTINE_TOKEN)
-      && env.WORKBENCH_GITHUB_READ_TOKEN, 'CODING_CONFIGURATION_INVALID');
+      && (spec.visibility === 'public' || env.WORKBENCH_GITHUB_READ_TOKEN), 'CODING_CONFIGURATION_INVALID');
     return { spec, verifiedUntil, token: env.WORKBENCH_ROUTINE_TOKEN, githubToken: env.WORKBENCH_GITHUB_READ_TOKEN };
   } catch { throw new Error('CODING_CONFIGURATION_INVALID'); }
 }
@@ -40,7 +40,7 @@ export class HostedCoding {
     const record = own(state.requests, requestId);
     need(record?.proposal?.kind === 'coding' && record.proposalHash === proposalHash && record.contextRevision === state.project.revision
       && record.status === 'awaiting_approval' && record.provider?.httpStatus >= 200 && record.provider.httpStatus < 300
-      && fresh(state.project, this.now()), 'CODING_APPROVAL_MISMATCH');
+      && fresh(state.project, this.now()) && fresh(record.contextSnapshot, this.now()), 'CODING_APPROVAL_MISMATCH');
     return record;
   }
   async review({ requestId, proposalHash }) {

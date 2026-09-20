@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { attemptLimit } from './continuation.js';
 import { endpoint, gatewayRequest } from '../gateway-request.js';
 import { rejectionDiagnostics } from '../rejection-diagnostics.js';
 import { databasePool, HostedStore } from './store.js';
@@ -23,9 +24,12 @@ export function hostedTransport({ store, requestId, inputDigest, sessionId, send
     await store.change(state => {
       const record = Object.hasOwn(state.requests, requestId) && state.requests[requestId];
       if (!state.project.sources.every(s => Date.parse(s.observedAt) <= Date.parse(now()) && Date.parse(s.expiresAt) > Date.parse(now()))
-        || Object.values(state.requests).filter(r => r.provider).length >= 5
+        || Object.values(state.requests).filter(r => r.provider).length >= attemptLimit(state)
         || state.paused || state.model !== HOSTED_MODEL || !record || record.status !== 'thinking'
         || record.contextRevision !== state.project.revision || record.projectId !== state.project.id
+        || !record.contextSnapshot?.sources?.every(s => s.exposure === 'model_allowed' && Date.parse(s.observedAt) <= Date.parse(now()) && Date.parse(s.expiresAt) > Date.parse(now()))
+        || (state.continuation && (state.continuation.contextRevision !== record.contextRevision || state.continuation.model !== state.model
+          || !record.contextSnapshot.sources.some(s => s.id === state.continuation.source.id && s.revision === state.continuation.source.revision)))
         || record.inputDigest !== inputDigest || record.provider || !sessionId || bytes > 12000
         || state.reservedMicros + reserve > state.budgetMicros) throw new Error('HOSTED_PROVIDER_ADMISSION_DENIED');
       state.reservedMicros += reserve;
