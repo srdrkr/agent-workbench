@@ -37,7 +37,7 @@ test('strict wire schema retains required citations while local validation retai
     assert.ok(schema.required.includes('citations'));
     assert.equal(schema.properties.citations.type, 'array');
     assert.equal(schema.properties.citations.minItems, 1);
-    assert.deepEqual(schema.properties.kind.enum, ['coding', 'commitment', 'clarify']);
+    assert.deepEqual(schema.properties.kind.enum, ['coding', 'commitment', 'clarify', 'plan']);
     assert.deepEqual(schema.properties.candidateId.anyOf.map(item => item.type), ['string', 'null']);
     assert.ok(!/"(?:minLength|maxLength|maxItems)":/.test(JSON.stringify(schema)));
     assert.match(schema.properties.rationale.description, /Maximum string length: 2000/);

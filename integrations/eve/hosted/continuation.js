@@ -1,3 +1,4 @@
+import { progressSource } from './pilot.js';
 import { createHash } from 'node:crypto';
 const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const need = (ok, code = 'CONTINUATION_UNAVAILABLE') => { if (!ok) throw new Error(code); };
@@ -86,11 +87,15 @@ export function judgmentProject(state, now) {
   const project = structuredClone(state.project);
   const attempted = new Set(Object.values(state.coding?.jobs ?? {}).map(j => j.spec.taskId));
   project.codingCandidates = project.codingCandidates.filter(c => !attempted.has(c.spec.taskId));
-  if (state.continuation) {
+  if (state.continuation && !state.pilot) {
     need(state.continuation.contextRevision === project.revision && state.continuation.model === state.model, 'CONTINUATION_CONTEXT_CHANGED');
     const source = state.continuation.source;
     need(Date.parse(source.expiresAt) > Date.parse(now), 'CONTINUATION_SOURCE_EXPIRED');
     project.sources.push(structuredClone(source));
+  }
+  if (state.pilot) {
+    need(!project.sources.some(s => s.id === 'project-progress') && project.sources.length < 12, 'INVALID_CONTEXT');
+    project.sources.push(progressSource(state, now));
   }
   return project;
 }

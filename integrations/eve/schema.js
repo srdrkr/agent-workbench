@@ -1,7 +1,7 @@
 import { z } from 'zod';
 
 export const proposalSchema = z.strictObject({
-  kind: z.enum(['coding', 'commitment', 'clarify']),
+  kind: z.enum(['coding', 'commitment', 'clarify', 'plan']),
   candidateId: z.string().min(1).max(120).nullable(),
   title: z.string().min(1).max(240),
   rationale: z.string().min(1).max(2000),

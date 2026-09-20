@@ -1,0 +1,32 @@
+name: Steward progress
+on:
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+  workflow_dispatch:
+permissions: {}
+concurrency:
+  group: steward-progress
+  cancel-in-progress: false
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      # No checkout or event content executes here. The endpoint only reads its own known jobs.
+      - name: Refresh known coding results
+        env:
+          STEWARD_ORIGIN: ${{ secrets.STEWARD_ORIGIN }}
+          STEWARD_MONITOR_SECRET: ${{ secrets.STEWARD_MONITOR_SECRET }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$STEWARD_ORIGIN" || -z "$STEWARD_MONITOR_SECRET" ]]; then
+            echo 'Progress monitoring is not configured.'
+            exit 0
+          fi
+          curl --fail --silent --show-error --max-time 80 \
+            --request POST --header "Authorization: Bearer $STEWARD_MONITOR_SECRET" \
+            "$STEWARD_ORIGIN/api/progress"

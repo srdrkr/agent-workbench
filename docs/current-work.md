@@ -1,17 +1,9 @@
 # Current work
 
-## Completed locally
+The first real Steward → owner approval → Claude Routine → tested draft PR loop completed. Decisions history and continuation recovery are merged.
 
-Hosted brief promotion, exact coding approval, durable Routines dispatch and GitHub evidence reconciliation are implemented and independently reviewed. Existing owner web and Telegram paths are implemented. Live configuration is private and must be inspected before claiming it is active.
+The current milestone is a usable personal pilot: cumulative allowance controls, repeatable reviewed assignments, understandable progress, durable project memory and quiet GitHub follow-up. Read [personal-pilot.md](personal-pilot.md) for the workflow, operational prerequisites and remaining manual boundaries.
 
-## First application assignment
+Next: exercise a useful project request from Steward, review one bounded coding assignment, observe the resulting draft PR, and verify that the following Eve decision uses its durable progress. Track usefulness, interventions, failure classes and reserved model allowance over the personal pilot. Keep one learning effort active.
 
-Improve the web Decisions view so current-project decisions and earlier-project decisions are visibly separate. Preserve original ordering within each group and show a clear empty current-state message. Historical records remain inspectable. Do not change approval conditions, API calls, dispatch, authentication, accounting or context state.
-
-Bounded files: `integrations/eve/app/app.vue`, a new pure `integrations/eve/app/utils/decision-history.js`, and `integrations/eve/test/decision-history.test.js`. The helper should group by equality with the active project revision without mutating its inputs. Regression coverage should include mixed revisions, empty/current-only/history-only inputs and stable ordering. Pass both CI jobs and return a draft PR with the supplied task marker.
-
-This document defines a candidate, not execution authority. The exact approved base revision, branch, task ID, routine and scope are bound by the hosted approval record. No other feature, refactor, dependency, merge or deployment belongs in this assignment.
-
-## Later
-
-Complete the observed loop and owner review before starting another task. Automatic result monitoring, context synchronization and SMS remain future work.
+Later goals are SMS, additional bots, a coordinator and richer project knowledge retrieval. Those should follow evidence from the first useful loop, not add machinery before it is needed.

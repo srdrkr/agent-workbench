@@ -147,7 +147,7 @@ test('completion source expiry is enforced at provider admission and commitment 
   }); store = f.store;
   const review = await f.steward.reviewContinuation(); await f.steward.approveContinuation({ reviewHash: review.reviewHash });
   const ask = { requestId: 'next', projectId: project.id, message: 'Next?' };
-  assert.equal((await f.steward.propose(ask)).status, 'held'); assert.equal(sends, 0);
+  assert.equal((await f.steward.propose(ask)).status, 'not_sent'); assert.equal(sends, 0);
   assert.equal((await store.read()).reservedMicros, 500000);
   // Independently check a previously valid commitment after its snapshot expires.
   await store.change(s => { const r = s.requests.next; r.status = 'awaiting_approval'; r.proposal = proposal; r.proposalHash = 'synthetic-approval'; });

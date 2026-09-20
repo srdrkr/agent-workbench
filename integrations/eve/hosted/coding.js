@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { validatedSpec } from '../../../src/task-policy.js';
 import { fireRoutine, repositoryPreflight, collectEvidence, githubReader, sessionReference } from '../../../src/providers.js';
 const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
@@ -19,7 +19,7 @@ export function codingConfig(env = process.env) {
       && Number.isFinite(Date.parse(verifiedUntil)) && typeof env.WORKBENCH_ROUTINE_TOKEN === 'string'
       && env.WORKBENCH_ROUTINE_TOKEN.length >= 20 && !/\s/.test(env.WORKBENCH_ROUTINE_TOKEN)
       && (spec.visibility === 'public' || env.WORKBENCH_GITHUB_READ_TOKEN), 'CODING_CONFIGURATION_INVALID');
-    return { spec, verifiedUntil, token: env.WORKBENCH_ROUTINE_TOKEN, githubToken: env.WORKBENCH_GITHUB_READ_TOKEN };
+    return { spec, verifiedUntil, repeatable: env.WORKBENCH_CODING_REPEATABLE === 'yes', token: env.WORKBENCH_ROUTINE_TOKEN, githubToken: env.WORKBENCH_GITHUB_READ_TOKEN };
   } catch { throw new Error('CODING_CONFIGURATION_INVALID'); }
 }
 export function codingAssignment(task) {
@@ -35,13 +35,47 @@ export class HostedCoding {
     this.store = store; this.config = config; this.send = send; this.read = read ?? (config ? githubReader(config.githubToken) : null); this.now = now;
   }
   enabled() { return Boolean(this.config && Date.parse(this.config.verifiedUntil) > Date.parse(this.now())); }
-  fingerprint() { return hash({ spec: this.config.spec, verifiedUntil: this.config.verifiedUntil }); }
+  fingerprint() { return hash({ spec: this.config.spec, verifiedUntil: this.config.verifiedUntil, repeatable: this.config.repeatable === true }); }
   record(state, requestId, proposalHash) {
     const record = own(state.requests, requestId);
     need(record?.proposal?.kind === 'coding' && record.proposalHash === proposalHash && record.contextRevision === state.project.revision
-      && record.status === 'awaiting_approval' && record.provider?.httpStatus >= 200 && record.provider.httpStatus < 300
+      && record.status === 'awaiting_approval' && (record.source === 'authenticated_owner_assignment' || (record.provider?.httpStatus >= 200 && record.provider.httpStatus < 300))
       && fresh(state.project, this.now()) && fresh(record.contextSnapshot, this.now()), 'CODING_APPROVAL_MISMATCH');
     return record;
+  }
+  allowedConnection(spec) {
+    const fixed = this.config.spec;
+    return ['repository', 'visibility', 'routineId', 'baseBranch', 'mode'].every(k => spec[k] === fixed[k])
+      && hash(spec.requiredChecks) === hash(fixed.requiredChecks);
+  }
+  async prepare({ objective, acceptance, allowedPaths, expectedContextRevision }) {
+    need(this.enabled() && this.config.repeatable, 'CODING_NOT_ENABLED');
+    const base = await this.read(`/repos/${this.config.spec.repository}/commits/${this.config.spec.baseBranch}`);
+    const id = randomUUID();
+    let spec;
+    try { spec = validatedSpec({ ...this.config.spec, taskId: `task-${id.slice(0, 18)}`, baseSha: base.sha,
+      objective, acceptance, allowedPaths }); } catch { throw new Error('INVALID_REQUEST'); }
+    await repositoryPreflight(spec, this.read).catch(() => { throw new Error('CODING_PREFLIGHT_FAILED'); });
+    const record = await this.store.change(state => {
+      need(state.pilot && state.project.revision === expectedContextRevision && fresh(state.project, this.now()), 'APPROVAL_MISMATCH');
+      need(!state.paused && !control(state).paused && !unresolved(control(state)) && Object.keys(state.requests).length < 500, 'CODING_ADMISSION_PAUSED');
+      const project = structuredClone(state.project);
+      project.codingCandidates = [{ id: spec.taskId, title: objective.slice(0, 160), sourceIds: [project.sources[0].id], spec }];
+      const proposal = { kind: 'coding', candidateId: spec.taskId, title: objective.slice(0, 240), rationale: acceptance.slice(0, 2000), citations: [project.sources[0].id], question: null };
+      const record = { id, source: 'authenticated_owner_assignment', projectId: state.project.id,
+        message: 'Owner prepared a coding assignment', contextRevision: state.project.revision, contextSnapshot: project,
+        status: 'awaiting_approval', createdAt: this.now(), proposal,
+        proposalHash: hash({ projectId: state.project.id, contextRevision: state.project.revision, proposal }) };
+      state.requests[id] = record;
+      event(state, 'coding_assignment_prepared', { requestId: id, scopeHash: hash(spec) }, this.now()); return record;
+    });
+    return this.review({ requestId: record.id, proposalHash: record.proposalHash });
+  }
+  async close(input) {
+    // One owner action, preserving the ordered observation -> independent evidence -> close gates.
+    await this.observe({ ...input, observedAt: this.now() });
+    await this.reconcile({ requestId: input.requestId });
+    return this.release({ requestId: input.requestId });
   }
   async review({ requestId, proposalHash }) {
     need(this.enabled(), 'CODING_NOT_ENABLED');
@@ -50,7 +84,7 @@ export class HostedCoding {
       need(!state.paused && !c.paused && !unresolved(c), 'CODING_ADMISSION_PAUSED');
       const candidate = record.contextSnapshot.codingCandidates.find(x => x.id === record.proposal.candidateId);
       const spec = validatedSpec(candidate.spec);
-      need(hash(spec) === hash(this.config.spec), 'CODING_SCOPE_NOT_CONFIGURED');
+      need(this.config.repeatable ? this.allowedConnection(spec) : hash(spec) === hash(this.config.spec), 'CODING_SCOPE_NOT_CONFIGURED');
       need(!Object.values(c.jobs).some(j => j.spec.taskId === spec.taskId), 'CODING_TASK_ALREADY_ATTEMPTED');
       const review = { requestId, proposalHash, contextRevision: state.project.revision, spec,
         scopeHash: hash(spec), configurationHash: this.fingerprint(),
@@ -78,7 +112,7 @@ export class HostedCoding {
         && Date.parse(review.expiresAt) > Date.parse(this.now()), 'CODING_APPROVAL_MISMATCH');
       need(!state.paused && !c.paused && !unresolved(c), 'CODING_ADMISSION_PAUSED');
       need(!Object.values(c.jobs).some(j => j.spec.taskId === review.spec.taskId), 'CODING_TASK_ALREADY_ATTEMPTED');
-      const task = { id: requestId, spec: review.spec, scopeHash: review.scopeHash, contextRevision: review.contextRevision,
+      const task = { id: requestId, projectId: state.project.id, spec: review.spec, scopeHash: review.scopeHash, contextRevision: review.contextRevision,
         branch: review.branch, marker: review.marker, dispatch: 'unknown', execution: 'unobserved', stopRequested: false,
         dispatchStartedAt: this.now(), approval: { reviewHash, proposalHash, expiresAt: review.expiresAt, approvedAt: this.now(), consumed: true,
           action: 'one_routine_fire', source: 'authenticated_owner_web', incrementalSpendUsd: 0 }, result: null };
@@ -110,6 +144,7 @@ export class HostedCoding {
     return this.store.change(state => {
       const task = state.coding.jobs[requestId];
       if ((task.result?.collectionStartedEvent ?? 0) > start.seq) return task;
+      if (task.result?.result === 'tested_draft_pr') task.lastTestedResult = task.result;
       task.result = { ...evidence, collectionStartedAt: start.at, collectionStartedEvent: start.seq, observedAt: this.now() };
       event(state, 'coding_result_observed', { requestId, result: evidence.result }, this.now()); return task;
     });

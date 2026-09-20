@@ -99,7 +99,7 @@ test('provider budget and pause deny before I/O, without spending the allowance'
       if (pause) await store.change(state => { state.paused = true; });
       return hostedTransport({ store, requestId: input.hostedRequestId, inputDigest: digest(input), sessionId: 'test', send: () => { sends++; } })(endpoint, wire());
     }, pause ? 1_000_000 : 0, false); store = f.store;
-    assert.equal((await f.steward.propose(ask)).status, 'held');
+    assert.equal((await f.steward.propose(ask)).status, 'not_sent');
     assert.equal(sends, 0); assert.equal((await store.read()).reservedMicros, 0);
   }
 });
@@ -139,7 +139,7 @@ test('real Better Auth rejects public signup, wrong password, foreign owner and 
 
 test('a fixture or alternate Eve service cannot produce a hosted result without admitted provider evidence', async t => {
   const { steward, store } = await fixture(t, async () => proposal, 1_000_000, false);
-  assert.equal((await steward.propose(ask)).status, 'held');
+  assert.equal((await steward.propose(ask)).status, 'not_sent');
   assert.equal((await store.read()).reservedMicros, 0);
 });
 
@@ -159,7 +159,7 @@ test('successful hosted inference uses the durable reservation; oversized wire f
       return proposal;
     }, 1_000_000, false); store = f.store;
     const result = await f.steward.propose(ask);
-    assert.equal(result.status, oversized ? 'held' : 'awaiting_approval');
+    assert.equal(result.status, oversized ? 'not_sent' : 'awaiting_approval');
     assert.equal(sends, oversized ? 0 : 1);
     assert.equal((await store.read()).reservedMicros > 0, !oversized);
   }
@@ -237,7 +237,7 @@ test('recovery respects Retry-After and cannot bypass another unresolved request
     await assert.rejects(f.steward.propose(f.recovery), /RETRY_NOT_READY/); assert.equal(f.sends(), 0);
   }
   const f = await rejectedFixture(t); await f.store.change(s => { s.budgetMicros = s.reservedMicros; });
-  assert.equal((await f.steward.propose(f.recovery)).status, 'held'); assert.equal(f.sends(), 0);
+  assert.equal((await f.steward.propose(f.recovery)).status, 'not_sent'); assert.equal(f.sends(), 0);
   assert.equal((await f.store.read()).reservedMicros, 1);
 });
 

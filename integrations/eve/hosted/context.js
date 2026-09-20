@@ -14,6 +14,7 @@ function proposal(input, now) {
 }
 export async function previewContext(store, input, now) {
   const project = proposal(input, now);
+  requireValue(!project.sources.some(s => s.id === 'project-progress') && project.sources.length < 12, 'INVALID_CONTEXT');
   return store.change(state => {
     requireValue(!activeWork(state), 'CONTEXT_WORK_UNRESOLVED');
     const version = (state.contextVersion ?? 0) + 1;
