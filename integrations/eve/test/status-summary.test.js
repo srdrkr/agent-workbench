@@ -225,3 +225,36 @@ test('the same persisted state gives the same text on both surfaces', async () =
   assert.equal(await w.summary(LINK), `${web}\n${LINK}`);
   assert.equal(await w.summary(), web);
 });
+
+
+test('recorded execution supersedes an unknown dispatch receipt', async () => {
+  for (const execution of ['running', 'exited', 'stopped']) {
+    for (const result of [null, 'tested_draft_pr']) {
+      const w = workspace();
+      codingJob(w.state, { dispatch: 'unknown', execution, result });
+      const p = parts(await w.summary());
+      assert.doesNotMatch(p.Progress, /start unconfirmed/);
+      assert.equal(p.Blocker, 'none recorded');
+      assert.equal(p.Next, execution === 'running' ? 'wait for Claude; check GitHub later'
+        : result ? 'close the coding run, then review the draft PR' : 'check GitHub, then close the coding run');
+      assert.equal(w.state.coding.jobs['job-1'].dispatch, 'unknown');
+    }
+  }
+});
+
+test('exhausted allowance keeps unresolved work ahead of a blocked allowance review', async () => {
+  for (const limit of ['dollars', 'attempts']) {
+    const w = workspace({ budgetMicros: limit === 'dollars' ? 1 : 100, reserve: 1,
+      judge: async () => { throw new Error('synthetic provider failure'); } });
+    if (limit === 'attempts') w.state.maxProviderAttempts = 1;
+    const request = await w.steward.propose(ask());
+    assert.equal(request.status, 'held');
+    const p = parts(await w.summary());
+    assert.match(p.Blocker, limit === 'dollars' ? /allowance used up/ : /request limit reached/);
+    assert.equal(p.Next, 'review the held attempt');
+  }
+  const w = workspace();
+  w.state.reservedMicros = w.state.budgetMicros;
+  codingJob(w.state, { dispatch: 'unknown', execution: 'exited', result: 'tested_draft_pr' });
+  assert.equal(parts(await w.summary()).Next, 'close the coding run, then review the draft PR');
+});

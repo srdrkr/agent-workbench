@@ -58,7 +58,7 @@ function facts(view) {
   const jobOpen = Boolean(job && !job.releasedAt && !failedStart);
   return {
     v, job, held, thinking, jobOpen, failedStart,
-    startUnconfirmed: jobOpen && dispatch !== 'accepted',
+    startUnconfirmed: jobOpen && dispatch !== 'accepted' && !['running', 'exited', 'stopped'].includes(execution),
     running: jobOpen && execution === 'running',
     ended: jobOpen && ['exited', 'stopped'].includes(execution),
     awaiting: current.find(r => r.status === 'awaiting_approval' && r.proposal) ?? null,
@@ -121,8 +121,6 @@ function next(f) {
     return ['resume requests when ready', ''];
   }
   if (v.contextFresh === false) return ['update the project brief', ''];
-  if (dollarsExhausted) return ['review the pilot allowance; no automatic top-up', ''];
-  if (attemptsExhausted) return ['review the pilot allowance', ''];
   if (held) return ['review the held attempt', ''];
   if (thinking) return ['wait for Eve, then review the proposal', ''];
   if (jobOpen) {
@@ -138,6 +136,8 @@ function next(f) {
     return [result === 'branch_without_pr' ? 'check the pushed branch; no PR yet' : result === 'conflicting_prs' ? 'resolve the several matching PRs' : 'review the unmerged PR', ''];
   }
   if (failedStart && !job.releasedAt) return ['review the failed coding start in the web app', ''];
+  if (dollarsExhausted) return ['review the pilot allowance; no automatic top-up', ''];
+  if (attemptsExhausted) return ['review the pilot allowance', ''];
   if (awaiting) return [awaiting.proposal.kind === 'coding' ? 'review the coding assignment: ' : 'decide on the proposal: ', awaiting.proposal.title];
   if (v.continuationAvailable) return ['review the next Eve request', ''];
   if (open) return ['work on: ', open.title];
