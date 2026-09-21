@@ -1,4 +1,5 @@
 import { timingSafeEqual, createHash } from 'node:crypto';
+import { statusSummary } from '../shared/status-summary.js';
 const fail = code => { throw new Error(code); };
 const response = (status, error) => Response.json(error ? { error } : { ok: true }, { status, headers: { 'cache-control': 'no-store' } });
 const positiveId = value => Number.isSafeInteger(value) && value > 0;
@@ -50,17 +51,15 @@ export class TelegramChannel {
     return response(200);
   }
   async process(id, text) {
-    let reply;
+    let reply; let complete = false;
     try {
       if (text.length > 2000) {
         reply = 'Please keep your question under 2,000 characters. No model request was sent.';
       } else if (['/start', '/help'].includes(text)) {
-        reply = 'Send a question about the approved project brief. /status shows current decisions; /pause stops new model requests. Review and approve commitments in the web app. Coding availability is shown in the web app.';
+        reply = 'Send a question about the approved project brief. /status shows a short project status; /pause stops new model requests. Review and approve commitments in the web app. Coding availability is shown in the web app.';
       } else if (text === '/status') {
-        const view = await this.steward.view();
-        const updates = (await this.store.read()).telegram.updates;
-        const uncertain = Object.values(updates).filter(u => u.id !== id && u.status !== 'sent').length;
-        reply = `${view.project.name}\n${view.paused ? 'Model requests paused.' : 'Model requests enabled.'}\n${view.providerAttempts}/${view.maxProviderAttempts} model attempts; ${view.commitments.length} approved commitments.\n${view.requests.filter(r => !r.contextRevision || r.contextRevision === view.project.revision).map(r => `${r.status}: ${r.proposal?.title ?? 'Request saved; outcome not verified'}`).join('\n') || 'No requests yet.'}${uncertain ? `\n${uncertain} text delivery/update(s) need review. No automatic resend.` : ''}`;
+        // The same summary the web view shows, already within 280 characters including the link.
+        reply = statusSummary(await this.steward.view(), { link: this.config.origin }); complete = true;
       } else if (text === '/pause') {
         await this.steward.pause(); reply = 'New model requests are paused. An already-started request may still complete.';
       } else if (text.startsWith('/')) {
@@ -71,7 +70,7 @@ export class TelegramChannel {
         reply = result.proposal ? `${result.proposal.title}\n\n${result.proposal.rationale}\n\nSources: ${result.proposal.citations.join(', ')}${result.proposal.question ? `\n\n${result.proposal.question}` : ''}\n\n${result.proposal.kind === 'coding' ? 'Review this coding proposal in the web app. No work was dispatched by this message.' : 'This is a proposal. It has not been approved.'}` : 'Eve did not return a verified proposal. The attempt is held for review; it will not be retried automatically.';
       }
     } catch { reply = 'The request could not be completed. Check the web app for current context, allowance, and any held attempt.'; }
-    const payload = { chat_id: this.config.chatId, text: `${reply.slice(0,3600)}\n\nReview: ${this.config.origin}`, link_preview_options: { is_disabled: true } };
+    const payload = { chat_id: this.config.chatId, text: complete ? reply : `${reply.slice(0,3600)}\n\nReview: ${this.config.origin}`, link_preview_options: { is_disabled: true } };
     // Commit send intent first. Telegram has no application idempotency key for
     // sendMessage, so a lost response stays unknown instead of sending twice.
     const admitted = await this.store.change(state => {
