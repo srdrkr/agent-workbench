@@ -1,3 +1,5 @@
+import { FollowThrough } from './follow-through.js';
+import { createCodeReview } from './code-review.js';
 import { databasePool, HostedStore } from './store.js';
 import { ownerAuth } from './auth.js';
 import { HostedSteward } from './steward.js';
@@ -16,7 +18,11 @@ export async function getHostedRuntime() {
       host: process.env.WORKBENCH_EVE_ORIGIN || origin, authToken: process.env.WORKBENCH_EVE_ACCESS_TOKEN, timeoutMs: 60_000 });
     const coding = new HostedCoding(store, { config: codingConfig() });
     const steward = new HostedSteward(store, judge, { coding });
-    return { store, steward, handler: hostedHandler({ auth, steward, ownerEmail, origin }) };
+    const followThrough = process.env.WORKBENCH_FOLLOW_THROUGH_ENABLED === 'yes' ? new FollowThrough({ store, coding,
+      review: createCodeReview({ store, read: coding.read, judge: await createEveJudge({ enabled: process.env.WORKBENCH_EVE_MODE === 'hosted', hosted: true, review: true,
+        host: process.env.WORKBENCH_EVE_ORIGIN || origin, authToken: process.env.WORKBENCH_EVE_ACCESS_TOKEN, timeoutMs: 60_000 }) }),
+      correct: coding.config?.correctionsVerified === true ? input => coding.correct(input) : null }) : null;
+    return { store, steward, followThrough, handler: hostedHandler({ auth, steward, ownerEmail, origin }) };
   })();
   return runtime;
 }

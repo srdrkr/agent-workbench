@@ -102,3 +102,14 @@ export async function sendProgressNotification(config, job, send = fetch) {
   const body = await result.json();
   return result.ok && body.ok === true && positiveId(body.result?.message_id) && body.result.chat?.id === config.chatId;
 }
+
+export async function sendFollowThroughNotification(config, message, send = fetch) {
+  const suffix = `\n${config.origin}`;
+  if (suffix.length > 120) throw new Error('STATUS_LINK_TOO_LONG');
+  const text = `${message.slice(0, 280 - suffix.length)}${suffix}`;
+  const result = await send(`https://api.telegram.org/bot${config.token}/sendMessage`, { method: 'POST',
+    headers: { 'content-type': 'application/json' }, body: JSON.stringify({ chat_id: config.chatId, text,
+      link_preview_options: { is_disabled: true } }), redirect: 'error', signal: AbortSignal.timeout(10000) });
+  const body = await result.json();
+  return result.ok && body.ok === true && positiveId(body.result?.message_id) && body.result.chat?.id === config.chatId;
+}

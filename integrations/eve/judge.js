@@ -1,5 +1,5 @@
 import { Client } from 'eve/client';
-import { proposalSchema } from './schema.js';
+import { proposalSchema, codeReviewSchema } from './schema.js';
 import { judgmentObservation } from './stream-policy.js';
 
 /** Server-side adapter. Its caller owns disclosure approval and proposal authority. */
@@ -16,6 +16,7 @@ export async function createEveJudge(config = {}) {
   if (!Number.isInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 60_000) {
     throw new Error('JUDGE_CONFIG_INVALID');
   }
+  const schema = config.review === true ? codeReviewSchema : proposalSchema;
   const client = new Client({ host: host.href, auth: { bearer: config.authToken }, redirect: 'error' });
   return async ({ request, project, commitments, hostedRequestId }) => {
     // Disclosure is all-or-nothing: silently dropping sources would mislabel the
@@ -30,7 +31,7 @@ export async function createEveJudge(config = {}) {
     let message;
     try {
       if (config.hosted && !/^[a-z0-9][a-z0-9-]{0,63}$/.test(hostedRequestId ?? '')) throw new Error();
-      message = JSON.stringify({ request, project, commitments, ...(config.hosted ? { hostedRequestId } : {}) });
+      message = JSON.stringify({ request, project, commitments, ...(config.hosted ? { hostedRequestId } : {}), ...(config.review === true ? { mode: 'coding_review' } : {}) });
       if (typeof request !== 'string' || !request.trim() || !project || !Array.isArray(commitments)
           || Buffer.byteLength(message) > 32_768) throw new Error();
     } catch { throw new Error('JUDGE_INPUT_INVALID'); }
@@ -38,7 +39,7 @@ export async function createEveJudge(config = {}) {
       // Exactly one create attempt. An HTTP timeout does not prove server cancellation.
       const { response } = await client.sessions.create({
         message,
-        outputSchema: proposalSchema,
+        outputSchema: schema,
         ...judgmentObservation(timeoutMs),
       });
       const result = await response.result();
@@ -48,7 +49,7 @@ export async function createEveJudge(config = {}) {
           || !result.events.some(event => event.type === 'turn.completed')
           || !result.events.some(event => event.type === 'result.completed')
           || result.events.some(event => ['step.failed', 'turn.failed', 'session.failed'].includes(event.type))) throw new Error();
-      const parsed = proposalSchema.safeParse(result.data);
+      const parsed = schema.safeParse(result.data);
       if (!parsed.success) throw new Error();
       return parsed.data;
     } catch {
