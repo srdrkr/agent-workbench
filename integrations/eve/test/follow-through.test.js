@@ -205,3 +205,23 @@ test('real correction adapter refuses closed PRs, expired verification and anoth
     await assert.rejects(w.coding.correct(w.input), /HEAD_CHANGED|NOT_APPROVED|UNVERIFIED/); assert.equal(w.sends(), 0);
   }
 });
+
+test('a successful review reserves against the existing cumulative model allowance', async () => {
+  const w = fixture(); w.state.model = HOSTED_MODEL;
+  const review = { id: 'review-metered', status: 'intent', headSha: A };
+  w.task.followThrough.status = 'reviewing'; w.task.followThrough.reviews.push(review);
+  const judge = async input => {
+    const transport = hostedTransport({ store: w.store, requestId: review.id, inputDigest: digest(input), sessionId: 'synthetic-metered', now: w.now,
+      send: async () => new Response('synthetic response', { status: 200 }) });
+    await transport('https://ai-gateway.vercel.sh/v4/ai/language-model', { method: 'POST', headers: { 'ai-language-model-id': HOSTED_MODEL },
+      body: JSON.stringify({ maxOutputTokens: 2048, prompt: [{ role: 'user', content: JSON.stringify(input) }], tools: [{ type: 'function', name: 'final_output', inputSchema: { type: 'object' } }] }) });
+    return { verdict: 'ready', summary: 'Synthetic review completed', findings: [] };
+  };
+  const service = createCodeReview({ store: w.store, read: reader(w.task), judge, now: w.now });
+  assert.equal((await service({ task: w.task, job: w.task, review })).verdict, 'ready');
+  const request = w.state.requests[review.id];
+  assert.equal(request.status, 'review_completed'); assert.ok(request.provider.reservedMicros > 0);
+  assert.equal(w.state.reservedMicros, 1 + request.provider.reservedMicros);
+  assert.equal(w.state.budgetMicros, 10_000_000);
+  await assert.rejects(service({ task: w.task, job: w.task, review }), /ADMISSION_DENIED/);
+});
