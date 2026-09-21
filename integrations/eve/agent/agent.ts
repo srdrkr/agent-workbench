@@ -19,6 +19,7 @@ export default defineAgent({
             const output = tools.find(tool => tool.name === 'final_output');
             if (tools.length !== 1 || !output) throw new Error('JUDGE_UNEXPECTED_TOOLS');
             const input = JSON.parse(lastUserMessage ?? '{}');
+            if (input.mode === 'coding_review') return { toolCalls: [{ name: output.name, input: { verdict: 'ready', summary: 'Synthetic patch reviewed.', findings: [] } }] };
             const candidate = input.project?.codingCandidates?.[0];
             let proposal: { kind: 'coding' | 'commitment' | 'clarify'; candidateId: string | null;
               title: string; rationale: string; citations: string[]; question: string | null } = {

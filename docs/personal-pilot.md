@@ -26,7 +26,7 @@ The `Steward progress` GitHub Actions workflow calls `/api/progress` on a nomina
 
 The endpoint accepts only an authenticated POST and chooses a known job from server state; callers cannot supply URLs, repositories or tasks. It checks at most one eligible job per ten-minute admission window, within 14 days of dispatch. Merged jobs stop polling. Meaningful result fingerprints drive Telegram notifications; unchanged results are quiet. A crash after saving GitHub evidence does not lose notification eligibility. Send intent is saved before Telegram I/O; uncertain deliveries are displayed and never automatically repeated. Provider failures retain the previous evidence.
 
-This workflow needs to be on the default branch and secrets configured before automatic follow-up is live. The endpoint cannot call a model, dispatch coding, release a coding job, merge or deploy.
+This workflow needs to be on the default branch and secrets configured before automatic follow-up is live. With follow-through disabled, the endpoint cannot call a model, dispatch coding, release a coding job, merge or deploy. The optional [bounded follow-through](bounded-follow-through.md) adds task-authorized reviews and at most two correction sessions, with separate activation flags and a verified provider-exit gate. It never merges or deploys.
 
 ## Connection setup
 

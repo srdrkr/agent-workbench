@@ -1,3 +1,4 @@
+import { followThroughNotice } from './follow-through-notice.js';
 /**
  * One short project-status summary shared by Telegram and the web view.
  *
@@ -123,6 +124,8 @@ function next(f) {
   if (v.contextFresh === false) return ['update the project brief', ''];
   if (held) return ['review the held attempt', ''];
   if (thinking) return ['wait for Eve, then review the proposal', ''];
+  const follow = v.followThrough && followThroughNotice(v.followThrough);
+  if (follow) return ['', follow];
   if (jobOpen) {
     if (startUnconfirmed) return ['check Claude, then confirm or close the run', ''];
     if (ended) return [result === 'tested_draft_pr' ? 'close the coding run, then review the draft PR' : 'check GitHub, then close the coding run', ''];

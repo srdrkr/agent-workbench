@@ -1,5 +1,7 @@
 # Current work
 
+**September 21 implementation update:** PR 5 has reviewed status corrections. The next core slice is [bounded follow-through](bounded-follow-through.md): at most two corrections, three reviews and 24 hours per newly approved task. Source and synthetic verification do not imply live activation. Both activation flags remain off pending the saved Routine contract check and an owner-originated trial. Provider-exit confirmation remains manual; fully unattended handoff is not yet demonstrated.
+
 The first real Steward → owner approval → Claude Routine → tested draft PR loop completed. Decisions history and continuation recovery are merged.
 
 The current milestone is a usable personal pilot: cumulative allowance controls, repeatable reviewed assignments, understandable progress, durable project memory and quiet GitHub follow-up. Read [personal-pilot.md](personal-pilot.md) for the workflow, operational prerequisites and remaining manual boundaries.

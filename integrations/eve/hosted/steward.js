@@ -1,3 +1,4 @@
+import { followThroughView } from './follow-through.js';
 import { reviewPilot, approvePilot, saveNote, completeCommitment, progressView } from './pilot.js';
 import { createHash } from 'node:crypto';
 import { attemptLimit, continuationPacket, reviewContinuation, approveContinuation, judgmentProject } from './continuation.js';
@@ -50,7 +51,7 @@ export class HostedSteward {
     try { continuationPacket(state, this.now()); continuationAvailable = true; } catch { /* Fail closed until the run is verified and closed. */ }
     let continuationProblem = null;
     try { judgmentProject(state, this.now()); } catch (error) { continuationProblem = error.message; }
-    return { pilot: state.pilot ?? null, progress: progressView(state), monitor: state.monitor ? { lastCheckedAt: state.monitor.lastCheckedAt, lastError: state.monitor.lastError, notificationStatus: state.monitor.notificationStatus } : null, repeatableCoding: Boolean(this.coding?.config?.repeatable), continuationAvailable, continuationProblem, project: state.project, contextFresh: fresh(state.project, this.now()), judge: state.model,
+    return { followThrough: followThroughView(state), pilot: state.pilot ?? null, progress: progressView(state), monitor: state.monitor ? { lastCheckedAt: state.monitor.lastCheckedAt, lastError: state.monitor.lastError, notificationStatus: state.monitor.notificationStatus } : null, repeatableCoding: Boolean(this.coding?.config?.repeatable), continuationAvailable, continuationProblem, project: state.project, contextFresh: fresh(state.project, this.now()), judge: state.model,
       requests: Object.values(state.requests).sort((a, b) => (b.createdAt ?? '').localeCompare(a.createdAt ?? '') || (b.id ?? '').localeCompare(a.id ?? '')).slice(0, 50).map(r => ({ ...r, retryReviewHash: rejectionReviewHash(r) })), commitments: Object.values(state.commitments).filter(c => c.contextRevision === state.project.revision),
       historicalCommitments: Object.values(state.commitments).filter(c => c.contextRevision !== state.project.revision),
       providerAttempts: Object.values(state.requests).filter(r => r.provider).length, maxProviderAttempts: attemptLimit(state),

@@ -85,7 +85,7 @@ test('actual Eve runtime returns a structured mock judgment with no external too
   const temp = await mkdtemp(join(tmpdir(), 'workbench-eve-fixture-'));
   let child;
   try {
-    for (const path of ['agent', 'package.json', 'bounded-model.js', 'eval-ledger.js', 'eval-transport.js', 'rejection-diagnostics.js', 'gateway-request.js', 'hosted']) await cp(join(root, path), join(temp, path), { recursive: true });
+    for (const path of ['agent', 'package.json', 'bounded-model.js', 'eval-ledger.js', 'eval-transport.js', 'rejection-diagnostics.js', 'gateway-request.js', 'hosted', 'shared']) await cp(join(root, path), join(temp, path), { recursive: true });
     await symlink(join(root, 'node_modules'), join(temp, 'node_modules'));
     const port = await new Promise((resolvePort, reject) => {
       const server = createServer();
@@ -119,6 +119,8 @@ test('actual Eve runtime returns a structured mock judgment with no external too
     });
     const hosted = await createEveJudge({ enabled: true, hosted: true, host, authToken });
     assert.equal((await hosted({ ...input, hostedRequestId: 'hosted-request' })).kind, 'clarify');
+    const reviewer = await createEveJudge({ enabled: true, hosted: true, review: true, host, authToken });
+    assert.deepEqual(await reviewer({ ...input, hostedRequestId: 'review-runtime' }), { verdict: 'ready', summary: 'Synthetic patch reviewed.', findings: [] });
     const withCandidate = { ...input, project: { ...input.project,
       codingCandidates: [{ id: 'normalize', title: 'Normalize whitespace', sourceIds: ['brief'] }] } };
     assert.equal((await judge(withCandidate)).kind, 'coding');

@@ -32,6 +32,14 @@ export function hostedTransport({ store, requestId, inputDigest, sessionId, send
           || !record.contextSnapshot.sources.some(s => s.id === state.continuation.source.id && s.revision === state.continuation.source.revision)))
         || record.inputDigest !== inputDigest || record.provider || !sessionId || bytes > 12000
         || state.reservedMicros + reserve > state.budgetMicros) throw new Error('HOSTED_PROVIDER_ADMISSION_DENIED');
+      if (record.purpose === 'coding_review') {
+        const root = state.coding?.jobs[record.taskId]; const f = root?.followThrough;
+        if (!f || f.status !== 'reviewing' || state.coding.paused
+          || f.grant.scopeHash !== root.scopeHash || f.grant.contextRevision !== state.project.revision
+          || Date.parse(f.grant.expiresAt) <= Date.parse(now())
+          || state.coding.jobs[f.activeJobId]?.result?.headSha !== record.headSha
+          || !f.reviews.some(r => r.id === record.id && r.status === 'intent' && r.headSha === record.headSha)) throw new Error('HOSTED_PROVIDER_ADMISSION_DENIED');
+      }
       state.reservedMicros += reserve;
       record.provider = { sessionId, reservedMicros: reserve, requestBytes: bytes, requestHash: hash(serialized), intentAt: now() };
     });

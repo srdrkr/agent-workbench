@@ -1,3 +1,4 @@
+import { followThroughView } from './follow-through.js';
 import { createHash } from 'node:crypto';
 const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const need = (ok, code) => { if (!ok) throw new Error(code); };
@@ -24,7 +25,9 @@ export function progressView(state) {
 // A compact projection of durable typed facts, never an assistant-written replacement brief.
 export function progressSource(state, now) {
   const progress = progressView(state);
+  const follow = followThroughView(state);
   const facts = {
+    followThrough: follow ? { status: follow.status, reason: follow.reason, reviews: follow.reviews, corrections: follow.corrections, nextCheckAt: follow.nextCheckAt } : null,
     availableRecords: { notes: progress.notes.length, commitments: progress.commitments.length, codingJobs: progress.jobs.length },
     meaning: 'A bounded recent summary; older records remain stored. Historical observations, not live guarantees. Owner reports are labeled. Merge does not prove deployment. Never repeat completed work solely because an old brief lists it.',
     priority: progress.priority ? { text: boundedText(progress.priority.text, 700), at: progress.priority.at, source: 'owner_priority' } : null,

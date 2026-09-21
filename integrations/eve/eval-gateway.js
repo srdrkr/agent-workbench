@@ -110,7 +110,7 @@ export async function runGatewayEval({ runDir, keyFile, mock = false, timeoutMs 
   try {
     const key = mock ? null : keyFromFile(keyFile);
     const work = await mkdtemp(join(tmpdir(), 'workbench-gateway-eval-'));
-    for (const path of ['agent', 'package.json', 'bounded-model.js', 'eval-ledger.js', 'eval-transport.js', 'rejection-diagnostics.js', 'gateway-request.js', 'hosted']) {
+    for (const path of ['agent', 'package.json', 'bounded-model.js', 'eval-ledger.js', 'eval-transport.js', 'rejection-diagnostics.js', 'gateway-request.js', 'hosted', 'shared']) {
       await cp(join(integration, path), join(work, path), { recursive: true });
     }
     await symlink(join(integration, 'node_modules'), join(work, 'node_modules'));
