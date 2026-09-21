@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { TelegramChannel, telegramConfig } from '../hosted/telegram.js';
+import { statusSummary } from '../shared/status-summary.js';
 import { TestPool } from './pg-fixture.js';
 import { HostedStore, stateSchema } from '../hosted/store.js';
 const config = telegramConfig({ TELEGRAM_BOT_TOKEN: '12345:synthetic-telegram-test-token-1234', TELEGRAM_WEBHOOK_SECRET: 'synthetic-webhook-secret-thirty-two-chars', TELEGRAM_OWNER_USER_ID: '67890', TELEGRAM_OWNER_CHAT_ID: '67890', APP_ORIGIN: 'https://steward.example.com' });
@@ -75,4 +76,20 @@ test('oversized webhook and changed owner binding cannot schedule work', async t
   await f.store.change(state => { state.telegram = { binding: 'different', updates: {} }; });
   await assert.rejects(f.channel.receive(request(), f.schedule), /BINDING_CHANGED/);
   assert.equal(f.jobs.length, 0);
+});
+
+test('/status sends the shared summary within 280 characters including the review link', async t => {
+  let text;
+  const f = await fixture(t, async (_url, init) => { text = JSON.parse(init.body).text; return Response.json({ ok: true, result: { message_id: 56, chat: { id: config.chatId } } }); });
+  f.steward.view = async () => ({ project: { name: 'Synthetic project', revision: 'rev' }, paused: false, contextFresh: true, providerAttempts: 1, maxProviderAttempts: 5, requests: [], commitments: [],
+    progress: { notes: [], priority: null, commitments: [], jobs: [{ id: 'job', spec: { objective: 'Add a status line' }, dispatch: 'accepted', execution: 'unobserved', dispatchStartedAt: '2026-09-20T10:00:00.000Z', result: { result: 'tested_draft_pr', prUrl: 'https://github.com/example/repo/pull/7', observedAt: '2026-09-20T11:00:00.000Z' } }] } });
+  await f.channel.receive(request({ ...update, message: { ...update.message, text: '/status' } }), f.schedule);
+  await Promise.all(f.jobs);
+  assert.deepEqual(f.counts(), { calls: 0, sends: 1 });
+  assert.equal(text, statusSummary(await f.steward.view(), { link: config.origin }));
+  assert.ok(text.length <= 280, `${text.length} characters`);
+  assert.ok(text.endsWith(`\n${config.origin}`));
+  assert.equal(text.split(config.origin).length, 2);
+  assert.match(text, /draft PR passed required checks; Claude finish unconfirmed/);
+  assert.match(text, /^Progress: .+\. Blocker: .+\. Next: .+\.\n/);
 });
