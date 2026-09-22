@@ -93,3 +93,19 @@ test('/status sends the shared summary within 280 characters including the revie
   assert.match(text, /draft PR passed required checks; Claude finish unconfirmed/);
   assert.match(text, /^Progress: .+\. Blocker: .+\. Next: .+\.\n/);
 });
+
+for (const command of ['/start', '/help']) {
+  test(`${command} explains asking Eve, status, pause and approval with one link, under 280 characters and no model call`, async t => {
+    let text;
+    const f = await fixture(t, async (_url, init) => { text = JSON.parse(init.body).text; return Response.json({ ok: true, result: { message_id: 57, chat: { id: config.chatId } } }); });
+    await f.channel.receive(request({ ...update, message: { ...update.message, text: command } }), f.schedule);
+    await Promise.all(f.jobs);
+    assert.deepEqual(f.counts(), { calls: 0, sends: 1 });
+    assert.equal(text, `Send plain text to ask Eve about the approved project. /status checks recorded progress. /pause pauses new model requests. Approve work in the web app:\n${config.origin}`);
+    assert.ok(text.length < 280, `${text.length} characters`);
+    assert.match(text, /plain text to ask Eve/); assert.match(text, /\/status checks recorded progress/);
+    assert.match(text, /\/pause pauses new model requests/); assert.match(text, /Approve work in the web app/);
+    assert.equal(text.split(config.origin).length, 2); assert.equal(text.match(/https?:\/\//g).length, 1);
+    assert.equal((await f.store.read()).telegram.updates['tg-12345-50'].status, 'sent');
+  });
+}

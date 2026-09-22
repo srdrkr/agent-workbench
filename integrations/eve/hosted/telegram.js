@@ -4,6 +4,12 @@ const fail = code => { throw new Error(code); };
 const response = (status, error) => Response.json(error ? { error } : { ok: true }, { status, headers: { 'cache-control': 'no-store' } });
 const positiveId = value => Number.isSafeInteger(value) && value > 0;
 const timestamp = () => new Date().toISOString();
+const HELP_TEXT = 'Send plain text to ask Eve about the approved project. /status checks recorded progress. /pause pauses new model requests. Approve work in the web app:';
+const helpReply = origin => {
+  const suffix = `\n${origin}`;
+  if (HELP_TEXT.length + suffix.length >= 280) fail('HELP_LINK_TOO_LONG');
+  return `${HELP_TEXT}${suffix}`;
+};
 
 export function telegramConfig(env = process.env) {
   const token = env.TELEGRAM_BOT_TOKEN;
@@ -56,7 +62,8 @@ export class TelegramChannel {
       if (text.length > 2000) {
         reply = 'Please keep your question under 2,000 characters. No model request was sent.';
       } else if (['/start', '/help'].includes(text)) {
-        reply = 'Send a question about the approved project brief. /status shows a short project status; /pause stops new model requests. Review and approve commitments in the web app. Coding availability is shown in the web app.';
+        // Complete reply: four actions plus the one Steward link, fewer than 280 characters in total.
+        reply = helpReply(this.config.origin); complete = true;
       } else if (text === '/status') {
         // The same summary the web view shows, already within 280 characters including the link.
         reply = statusSummary(await this.steward.view(), { link: this.config.origin }); complete = true;
