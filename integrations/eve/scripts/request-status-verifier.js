@@ -1,0 +1,423 @@
+#!/usr/bin/env node
+/**
+ * Credential-free browser verification for the hosted request/status UI.
+ * Usage: node scripts/request-status-verifier.js --evidence <dir> [--netns]
+ *
+ * Setup (browsers, npm ci, build:hosted) is expected before verification when
+ * running under a network namespace.
+ */
+import { mkdtemp, mkdir, writeFile, rm, readFile, access } from 'node:fs/promises';
+import { createWriteStream, existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { spawn, execFile as execFileCb } from 'node:child_process';
+import { promisify } from 'node:util';
+import { chromium } from 'playwright';
+import {
+  startRequestStatusFixture,
+  PROPOSAL_OK,
+  eveRoot,
+  repoRoot,
+  scrubArtifactText,
+  resolveClientAssets,
+} from './request-status-fixture.js';
+
+const execFile = promisify(execFileCb);
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
+function phxNow() {
+  return new Date().toLocaleString('en-CA', { timeZone: 'America/Phoenix', hour12: false }).replace(', ', ' ') + ' MST';
+}
+function phxStamp() {
+  const d = new Date();
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Phoenix', year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+  }).formatToParts(d);
+  const g = t => parts.find(p => p.type === t).value;
+  return `${g('year')}${g('month')}${g('day')}-${g('hour')}${g('minute')}${g('second')}`;
+}
+
+function parseArgs(argv) {
+  const out = { evidence: null, netns: false, skipBuild: false };
+  for (let i = 2; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--evidence') out.evidence = argv[++i];
+    else if (a === '--netns') out.netns = true;
+    else if (a === '--skip-build') out.skipBuild = true;
+    else if (a === '--help') out.help = true;
+  }
+  return out;
+}
+
+async function gitSha(cwd) {
+  try {
+    const { stdout } = await execFile('git', ['rev-parse', 'HEAD'], { cwd });
+    return stdout.trim();
+  } catch { return null; }
+}
+
+async function ensureSpaBuild() {
+  try {
+    await resolveClientAssets(eveRoot);
+    return { built: false, reason: 'existing-generate-public' };
+  } catch {
+    // fall through
+  }
+  const node = process.execPath;
+  const env = {
+    HOME: process.env.HOME,
+    PATH: process.env.PATH,
+    CI: 'true',
+    EVE_TELEMETRY_DISABLED: '1',
+    EVE_TRACES_CONTENT: 'off',
+  };
+  // Least-invasive SPA shell: official `nuxt generate` (no config edits). Emits
+  // .output/public/index.html with window.__NUXT__.config for ssr:false clients.
+  // Distinct from CI `build:hosted` (Vercel preset), which we still run separately.
+  await new Promise((resolvePromise, reject) => {
+    const child = spawn(node, [join(eveRoot, 'node_modules/nuxt/bin/nuxt.mjs'), 'generate'], {
+      cwd: eveRoot, env, stdio: 'inherit',
+    });
+    child.on('exit', code => code === 0 ? resolvePromise() : reject(new Error(`nuxt generate exit ${code}`)));
+  });
+  await resolveClientAssets(eveRoot);
+  return { built: true, reason: 'ran-nuxt-generate' };
+}
+
+async function withFixture(evidenceDir, fn) {
+  const pgDir = await mkdtemp(join(tmpdir(), 'eve-rsv-pg-'));
+  let fixture;
+  const cleanup = { pgDirRemoved: false, browserClosed: false, serverClosed: false, leftoverProcesses: [], leftoverPorts: [], errors: [] };
+  let browser;
+  let result;
+  try {
+    fixture = await startRequestStatusFixture({ pgDir });
+    browser = await chromium.launch({ headless: true });
+    result = await fn({ fixture, browser, evidenceDir, pgDir });
+  } finally {
+    try { if (browser) { await browser.close(); cleanup.browserClosed = true; } } catch (e) { cleanup.errors.push(`browser:${e.message}`); }
+    try { if (fixture) { await fixture.close(); cleanup.serverClosed = true; } } catch (e) { cleanup.errors.push(`server:${e.message}`); }
+    try { await rm(pgDir, { recursive: true, force: true }); cleanup.pgDirRemoved = !existsSync(pgDir); } catch (e) { cleanup.errors.push(`pg:${e.message}`); }
+    if (fixture?.port) {
+      try {
+        const { stdout } = await execFile('bash', ['-lc', `ss -ltnp 2>/dev/null | grep -E ':${fixture.port}\\b' || true`]);
+        cleanup.leftoverPorts = stdout.trim() ? [stdout.trim()] : [];
+        cleanup.psSnapshot = [];
+      } catch { /* ss may be absent */ }
+    }
+  }
+  return { result, cleanup };
+}
+
+async function installBrowserRoute(context, fixture, scenarioFailures) {
+  await context.route('**/*', async (route) => {
+    const req = route.request();
+    const url = new URL(req.url());
+    if (url.protocol === 'data:' || url.protocol === 'blob:') {
+      await route.continue();
+      return;
+    }
+    if (url.origin === fixture.origin) {
+      await route.continue();
+      return;
+    }
+    fixture.blockedBrowser.push({
+      at: new Date().toISOString(),
+      source: 'browser',
+      url: url.href,
+      method: req.method(),
+    });
+    scenarioFailures.push(`unexpected-browser-request:${url.href}`);
+    await route.abort('blockedbyclient');
+  });
+}
+
+async function login(page, fixture) {
+  const { email, password } = fixture.getOwnerLogin();
+  await page.goto(fixture.origin + '/', { waitUntil: 'domcontentloaded' });
+  await page.getByLabel('Email').waitFor({ timeout: 20000 });
+  await page.getByLabel('Email').fill(email);
+  await page.getByLabel('Password').fill(password);
+  await page.getByRole('button', { name: 'Open my workspace' }).click();
+  await page.getByText('YOUR WORKSPACE').waitFor({ timeout: 20000 });
+  await page.getByRole('heading', { name: 'Help centre links' }).waitFor({ timeout: 20000 });
+}
+
+async function scenarioStartFinish({ fixture, page, shots }) {
+  const assertions = [];
+  const fail = (name, observed) => { assertions.push({ name, ok: false, observed }); throw new Error(name + ': ' + observed); };
+  const pass = (name, observed) => assertions.push({ name, ok: true, observed });
+
+  fixture.judge.hold();
+  const proposeWait = page.getByRole('button', { name: 'Ask Eve' });
+  await page.getByLabel('Request to Eve').fill('What is the next useful step for link normalization?');
+  // Click without waiting for network idle — propose stays open while judge held
+  const called = fixture.judge.waitUntilCalled({ timeoutMs: 20000 });
+  await proposeWait.click();
+  await called;
+
+  // In-progress indication from app.vue notice while busy
+  const considering = page.getByText('Eve is considering your request. This can take about a minute.');
+  try {
+    await considering.waitFor({ timeout: 10000 });
+  } catch (error) {
+    fail('missing-in-progress-state', 'Expected visible in-progress notice "Eve is considering your request. This can take about a minute." while the synthetic judge is held');
+  }
+  pass('in-progress-notice-visible', await considering.textContent());
+  await shots.inProgress();
+
+  // Optional: Waiting for Eve tag via refresh interval / busy refresh
+  // Release with valid commitment proposal
+  fixture.judge.release(PROPOSAL_OK);
+
+  await page.getByRole('heading', { name: 'Confirm the normalization priority' }).waitFor({ timeout: 20000 });
+  pass('proposal-title-visible', 'Confirm the normalization priority');
+  const approve = page.getByRole('button', { name: 'Approve commitment' });
+  await approve.waitFor({ timeout: 10000 });
+  pass('approve-commitment-visible', true);
+
+  const committed = await page.getByText('Committed', { exact: true }).count();
+  if (committed > 0) fail('must-not-show-approved-commitment', `found Committed tags=${committed}`);
+  pass('no-approved-commitment-tag', 'Committed not shown');
+
+  const codingHeading = await page.getByRole('heading', { name: 'Coding progress' }).count();
+  if (codingHeading > 0) fail('must-not-show-coding-progress', 'Coding progress section present');
+  pass('no-coding-progress-section', 'absent');
+
+  await shots.final();
+  return assertions;
+}
+
+async function scenarioBlocked({ fixture, page, shots }) {
+  const assertions = [];
+  const fail = (name, observed) => { assertions.push({ name, ok: false, observed }); throw new Error(name + ': ' + observed); };
+  const pass = (name, observed) => assertions.push({ name, ok: true, observed });
+
+  fixture.judge.hold();
+  await page.getByLabel('Request to Eve').fill('Please advise on the next step.');
+  const called = fixture.judge.waitUntilCalled({ timeoutMs: 20000 });
+  await page.getByRole('button', { name: 'Ask Eve' }).click();
+  await called;
+  try {
+    await page.getByText('Eve is considering your request. This can take about a minute.').waitFor({ timeout: 10000 });
+  } catch {
+    fail('missing-in-progress-state', 'Expected visible in-progress notice while the synthetic judge is held (blocked scenario)');
+  }
+  // Unsuccessful but admitted: provider intent recorded, proposal missing → held
+  fixture.judge.releaseHeld();
+
+  await page.getByText('Needs operator review').waitFor({ timeout: 20000 });
+  pass('held-status-visible', 'Needs operator review');
+  const heldCopy = page.getByText('Eve did not return a verified proposal. The attempt is held for operator review.');
+  await heldCopy.waitFor({ timeout: 10000 });
+  pass('held-explanation-visible', await heldCopy.textContent());
+
+  // Next action: Refresh status (ask form is blocked while held)
+  const refresh = page.getByRole('button', { name: 'Refresh status' });
+  await refresh.waitFor({ timeout: 10000 });
+  pass('refresh-status-available', true);
+  const blockedNotice = page.getByText('A prior model attempt needs review');
+  await blockedNotice.waitFor({ timeout: 10000 });
+  pass('blocked-next-action-notice', await blockedNotice.textContent());
+
+  await shots.blocked();
+  // Ensure we did not falsely show awaiting approval approve button for this record
+  const approve = await page.getByRole('button', { name: 'Approve commitment' }).count();
+  if (approve > 0) fail('held-must-not-offer-approve', `approve buttons=${approve}`);
+  pass('held-no-approve-commitment', 'absent');
+  return assertions;
+}
+
+async function runOnce({ evidenceDir, netnsReported }) {
+  const started = Date.now();
+  const headSha = await gitSha(repoRoot);
+  const baseSha = '342070c0e3c2e09205f4c8df38b3eb7f63644772';
+  const scenarios = [];
+  const scenarioFailures = [];
+  let browserVersion = null;
+  let networkCoverage = null;
+  let cleanupResults = [];
+  let secrets = [];
+
+  // Scenario 1 — fresh fixture
+  {
+    const { cleanup } = await withFixture(evidenceDir, async ({ fixture, browser }) => {
+      secrets = [fixture.getOwnerLogin().email, fixture.getOwnerLogin().password, fixture._credentials.secret];
+      browserVersion = browser.version();
+      const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+      const routeFailures = [];
+      await installBrowserRoute(context, fixture, routeFailures);
+      const page = await context.newPage();
+      const shots = {
+        async loggedIn() { await page.screenshot({ path: join(evidenceDir, '01-logged-in.png'), fullPage: true }); },
+        async inProgress() { await page.screenshot({ path: join(evidenceDir, '02-in-progress.png'), fullPage: true }); },
+        async final() { await page.screenshot({ path: join(evidenceDir, '03-final-proposal.png'), fullPage: true }); },
+        async blocked() {},
+      };
+      const sc = { name: 'start-finish-request', startedAt: phxNow(), ok: false, assertions: [], error: null, durationMs: 0 };
+      const t0 = Date.now();
+      try {
+        await login(page, fixture);
+        await shots.loggedIn();
+        sc.assertions = await scenarioStartFinish({ fixture, page, shots });
+        if (routeFailures.length) throw new Error(`network-boundary:${routeFailures.join(';')}`);
+        if (fixture.blockedBrowser.length) throw new Error(`browser-blocked:${JSON.stringify(fixture.blockedBrowser)}`);
+        sc.ok = sc.assertions.every(a => a.ok);
+      } catch (e) {
+        sc.error = String(e.message || e);
+        sc.ok = false;
+        try { await page.screenshot({ path: join(evidenceDir, '01-failure.png'), fullPage: true }); } catch { /* ignore */ }
+      } finally {
+        sc.durationMs = Date.now() - t0;
+        sc.finishedAt = phxNow();
+        networkCoverage = fixture.networkCoverage();
+        networkCoverage.netns = Boolean(netnsReported);
+        scenarios.push(sc);
+        await context.close();
+      }
+      if (!sc.ok) scenarioFailures.push(sc.error || sc.name);
+      return sc.name;
+    });
+    cleanupResults.push({ scenario: 'start-finish-request', ...cleanup });
+  }
+
+  // Scenario 2 — fresh fixture
+  {
+    const { cleanup } = await withFixture(evidenceDir, async ({ fixture, browser }) => {
+      secrets.push(fixture.getOwnerLogin().email, fixture.getOwnerLogin().password, fixture._credentials.secret);
+      const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+      const routeFailures = [];
+      await installBrowserRoute(context, fixture, routeFailures);
+      const page = await context.newPage();
+      const shots = {
+        async loggedIn() {},
+        async inProgress() {},
+        async final() {},
+        async blocked() { await page.screenshot({ path: join(evidenceDir, '04-blocked.png'), fullPage: true }); },
+      };
+      const sc = { name: 'blocked-request', startedAt: phxNow(), ok: false, assertions: [], error: null, durationMs: 0 };
+      const t0 = Date.now();
+      try {
+        await login(page, fixture);
+        sc.assertions = await scenarioBlocked({ fixture, page, shots });
+        if (routeFailures.length) throw new Error(`network-boundary:${routeFailures.join(';')}`);
+        if (fixture.blockedBrowser.length) throw new Error(`browser-blocked:${JSON.stringify(fixture.blockedBrowser)}`);
+        sc.ok = sc.assertions.every(a => a.ok);
+      } catch (e) {
+        sc.error = String(e.message || e);
+        sc.ok = false;
+        try { await page.screenshot({ path: join(evidenceDir, '04-failure.png'), fullPage: true }); } catch { /* ignore */ }
+      } finally {
+        sc.durationMs = Date.now() - t0;
+        sc.finishedAt = phxNow();
+        const cov = fixture.networkCoverage();
+        cov.netns = Boolean(netnsReported);
+        networkCoverage = {
+          ...cov,
+          blockedRequests: [...(networkCoverage?.blockedRequests || []), ...cov.blockedRequests],
+        };
+        scenarios.push(sc);
+        await context.close();
+      }
+      if (!sc.ok) scenarioFailures.push(sc.error || sc.name);
+      return sc.name;
+    });
+    cleanupResults.push({ scenario: 'blocked-request', ...cleanup });
+  }
+
+  const report = {
+    generatedAt: phxNow(),
+    baseSha,
+    headSha,
+    playwright: '1.63.0',
+    browser: { product: 'Chromium', version: browserVersion, channel: 'playwright-chromium' },
+    durationMs: Date.now() - started,
+    scenarios,
+    networkCoverage,
+    cleanup: cleanupResults,
+    ok: scenarios.every(s => s.ok) && scenarioFailures.length === 0,
+    secretsScrubNote: 'Owner email/password/auth secret generated per fixture and never written into this report.',
+  };
+
+  const raw = JSON.stringify(report, null, 2);
+  const scrubbed = scrubArtifactText(raw, secrets);
+  await writeFile(join(evidenceDir, 'report.json'), scrubbed);
+  // Grep evidence dir for secrets
+  const leakCheck = { checkedAt: phxNow(), leaks: [] };
+  for (const secret of secrets) {
+    if (!secret) continue;
+    const { stdout } = await execFile('bash', ['-lc', `grep -R --fixed-strings -l -- ${JSON.stringify(secret)} ${JSON.stringify(evidenceDir)} 2>/dev/null || true`]);
+    if (stdout.trim()) leakCheck.leaks.push({ hint: secret.slice(0, 4) + '…', files: stdout.trim().split('\n') });
+  }
+  await writeFile(join(evidenceDir, 'scrub-check.json'), JSON.stringify(leakCheck, null, 2));
+  if (leakCheck.leaks.length) {
+    report.ok = false;
+    report.scrubFailure = leakCheck;
+  }
+  return report;
+}
+
+async function main() {
+  const args = parseArgs(process.argv);
+  if (args.help) {
+    console.log('Usage: node scripts/request-status-verifier.js --evidence <dir> [--netns]');
+    process.exit(0);
+  }
+  const evidenceDir = resolve(args.evidence || join(tmpdir(), `eve-rsv-${phxStamp()}`));
+  await mkdir(evidenceDir, { recursive: true });
+
+  if (!args.skipBuild) {
+    const build = await ensureSpaBuild();
+    await writeFile(join(evidenceDir, 'build.json'), JSON.stringify(build, null, 2));
+  }
+
+  // Optionally re-exec inside netns
+  if (args.netns && process.env.EVE_RSV_IN_NETNS !== '1') {
+    // Bring up loopback inside new netns and re-exec
+    const self = fileURLToPath(import.meta.url);
+    const childArgs = [self, '--evidence', evidenceDir, '--skip-build'];
+    const result = await new Promise((resolvePromise) => {
+      const child = spawn('unshare', ['-rn', 'bash', '-lc', `ip link set lo up 2>/dev/null || true; EVE_RSV_IN_NETNS=1 HOME=${JSON.stringify(process.env.HOME)} PATH=${JSON.stringify(process.env.PATH)} CI=true ${JSON.stringify(process.execPath)} ${childArgs.map(a => JSON.stringify(a)).join(' ')}; echo EXIT:$?`], {
+        stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, EVE_RSV_IN_NETNS: '1' },
+      });
+      let out = ''; let err = '';
+      child.stdout.on('data', d => { out += d; process.stdout.write(d); });
+      child.stderr.on('data', d => { err += d; process.stderr.write(d); });
+      child.on('exit', code => resolvePromise({ code, out, err }));
+    });
+    // Prefer report written by child
+    try {
+      const report = JSON.parse(await readFile(join(evidenceDir, 'report.json'), 'utf8'));
+      report.networkCoverage = report.networkCoverage || {};
+      report.networkCoverage.netns = true;
+      report.networkCoverage.netnsNote = 'verification re-exec under unshare -rn with lo up';
+      await writeFile(join(evidenceDir, 'report.json'), JSON.stringify(report, null, 2));
+      process.exit(report.ok ? 0 : 1);
+    } catch {
+      console.error('netns child failed', result.code, result.err.slice(0, 500));
+      process.exit(result.code || 1);
+    }
+  }
+
+  // Probe whether netns works on this host (informational when not using --netns)
+  let netnsAvailable = false;
+  try {
+    await execFile('unshare', ['-rn', 'true']);
+    netnsAvailable = true;
+  } catch { netnsAvailable = false; }
+
+  const report = await runOnce({ evidenceDir, netnsReported: process.env.EVE_RSV_IN_NETNS === '1' });
+  report.networkCoverage = report.networkCoverage || {};
+  report.networkCoverage.netnsAvailable = netnsAvailable;
+  report.networkCoverage.netns = process.env.EVE_RSV_IN_NETNS === '1';
+  await writeFile(join(evidenceDir, 'report.json'), JSON.stringify(report, null, 2));
+  console.log(JSON.stringify({ ok: report.ok, evidenceDir, scenarios: report.scenarios.map(s => ({ name: s.name, ok: s.ok, error: s.error })) }, null, 2));
+  process.exit(report.ok ? 0 : 1);
+}
+
+main().catch(err => {
+  console.error(err);
+  process.exit(1);
+});

@@ -14,7 +14,8 @@
     "build": "EVE_TELEMETRY_DISABLED=1 EVE_TRACES_CONTENT=off eve build",
     "dev:hosted": "EVE_TELEMETRY_DISABLED=1 EVE_TRACES_CONTENT=off nuxt dev",
     "build:hosted": "EVE_TELEMETRY_DISABLED=1 EVE_TRACES_CONTENT=off nuxt build",
-    "hosted:setup": "node scripts/hosted-setup.js"
+    "hosted:setup": "node scripts/hosted-setup.js",
+    "verify:request-status": "node scripts/request-status-verifier.js"
   },
   "dependencies": {
     "@vercel/functions": "3.9.8",
@@ -26,6 +27,7 @@
     "zod": "4.5.4"
   },
   "devDependencies": {
-    "@electric-sql/pglite": "0.5.8"
+    "@electric-sql/pglite": "0.5.8",
+    "playwright": "1.63.0"
   }
 }
