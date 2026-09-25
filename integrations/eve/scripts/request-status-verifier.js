@@ -230,6 +230,159 @@ async function scenarioBlocked({ fixture, page, shots }) {
   return assertions;
 }
 
+function assertionKit() {
+  const assertions = [];
+  const fail = (name, observed) => { assertions.push({ name, ok: false, observed }); throw new Error(name + ': ' + observed); };
+  const pass = (name, observed) => assertions.push({ name, ok: true, observed });
+  return { assertions, fail, pass };
+}
+
+// Reads every status surface at once, so each checkpoint is one consistent observation.
+async function surfaces(page) {
+  return page.evaluate(() => {
+    const text = el => (el ? el.innerText.replace(/\s+/g, ' ').trim() : null);
+    const summary = document.querySelector('p.summary');
+    const ask = document.querySelector('section.ask');
+    return {
+      ownerState: summary?.dataset.ownerState ?? null, summary: text(summary),
+      button: text(ask?.querySelector('button')), buttonDisabled: Boolean(ask?.querySelector('button')?.disabled),
+      requestDisabled: Boolean(document.getElementById('request')?.disabled),
+      askNotice: text(ask?.querySelector('p.notice')),
+      cards: [...document.querySelectorAll('article.decision')].map(a => ({ tag: text(a.querySelector('.tag')), body: text(a) })),
+    };
+  });
+}
+
+// Invariants per owner state: every surface must tell the same story.
+function agreement(s, key) {
+  const problems = [];
+  if (s.ownerState !== key) problems.push(`summary state ${s.ownerState} != ${key}`);
+  const all = [s.summary, s.button, s.askNotice, ...s.cards.map(c => c.body)].filter(Boolean).join(' | ');
+  if (key === 'working') {
+    if (!/^State: In progress\./.test(s.summary)) problems.push('summary does not say In progress');
+    if (/ask Eve for the next useful step|ask again|send it again\b(?! is)|submit a new request/i.test(all.replace(/you do not need to send it again|no need to send the request again/gi, ''))) problems.push('a surface invites resending');
+    if (!['Working…', 'Eve is working…'].includes(s.button) || !s.buttonDisabled || !s.requestDisabled) problems.push(`ask panel not working: ${s.button}`);
+    if (!/you do not need to send it again/.test(s.askNotice ?? '')) problems.push('ask notice does not say the request is in progress');
+    if (s.cards[0]?.tag !== 'WAITING FOR EVE' && s.cards[0]?.tag !== 'Waiting for Eve') problems.push(`newest card is ${s.cards[0]?.tag}`);
+  }
+  if (key === 'awaiting_decision') {
+    if (!/^State: Your decision needed\./.test(s.summary) || !/Next: decide on the proposal/.test(s.summary)) problems.push('summary does not ask for a decision');
+    if (/\b(done|executed|completed)\b/i.test(s.summary)) problems.push('proposal described as executed');
+    if (s.button !== 'Ask Eve') problems.push(`button ${s.button}`);
+    if (!/your decision/i.test(s.cards[0]?.tag ?? '')) problems.push(`newest card is ${s.cards[0]?.tag}`);
+  }
+  if (key === 'completed') {
+    if (!/^State: (Completed|Decision recorded)\./.test(s.summary) || !/Next: /.test(s.summary)) problems.push('summary not completed with a next step');
+    if (!/committed/i.test(s.cards[0]?.tag ?? '')) problems.push(`newest card is ${s.cards[0]?.tag}`);
+  }
+  if (key === 'blocked') {
+    if (!/^State: Blocked\./.test(s.summary) || !/Next: review the held attempt/.test(s.summary)) problems.push('summary not blocked with next step');
+    if (!/needs review/.test(s.askNotice ?? '')) problems.push('ask notice does not name the held attempt');
+    if (!/needs operator review/i.test(s.cards[0]?.tag ?? '')) problems.push(`newest card is ${s.cards[0]?.tag}`);
+  }
+  return problems;
+}
+
+async function expectAgreement(page, key, name, kit, timeline) {
+  // Wait on the DOM (no sleeps) until the summary reports the state, then check every surface.
+  await page.locator(`p.summary[data-owner-state="${key}"]`).waitFor({ timeout: 20000 }).catch(() => {});
+  const s = await surfaces(page);
+  timeline.push({ checkpoint: name, at: new Date().toISOString(), ...s });
+  const problems = agreement(s, key);
+  if (problems.length) kit.fail(`surfaces-disagree:${name}`, `${problems.join('; ')} :: summary="${s.summary}" button="${s.button}"`);
+  kit.pass(`surfaces-agree:${name}`, { summary: s.summary, button: s.button, askNotice: s.askNotice, newestCard: s.cards[0]?.tag });
+}
+
+async function scenarioProgressWorking({ fixture, page, shots, timeline }) {
+  const kit = assertionKit();
+  await login(page, fixture);
+  await page.locator('p.summary[data-owner-state="ready"]').waitFor({ timeout: 20000 });
+  kit.pass('initial-ready', await page.locator('p.summary').innerText());
+  fixture.judge.hold();
+  await page.getByLabel('Request to Eve').fill('What is the next useful step for link normalization?');
+  const called = fixture.judge.waitUntilCalled({ timeoutMs: 20000 });
+  await page.getByRole('button', { name: 'Ask Eve' }).click();
+  await called;
+  // No poll has run yet: the first observation must already agree.
+  const immediate = await surfaces(page);
+  timeline.push({ checkpoint: 'immediately-after-submit', at: new Date().toISOString(), ...immediate });
+  const early = agreement(immediate, 'working');
+  if (early.length) kit.fail('surfaces-disagree:immediately-after-submit', `${early.join('; ')} :: summary="${immediate.summary}" button="${immediate.button}"`);
+  kit.pass('surfaces-agree:immediately-after-submit', { summary: immediate.summary, button: immediate.button });
+  await shots.working();
+  // Manual refresh is available while the request runs and returns the durable record.
+  const refresh = page.getByRole('button', { name: 'Refresh status' });
+  if (await refresh.isDisabled()) kit.fail('refresh-disabled-while-working', 'Refresh status disabled');
+  await refresh.click();
+  await page.getByText('Eve is working on this request.').first().waitFor({ timeout: 20000 });
+  await expectAgreement(page, 'working', 'after-manual-refresh', kit, timeline);
+  // Reload mid-judge restores the durable working state.
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await page.getByText('YOUR WORKSPACE').waitFor({ timeout: 20000 });
+  await expectAgreement(page, 'working', 'after-reload-mid-judge', kit, timeline);
+  if ((await page.getByRole('button', { name: 'Eve is working…' }).count()) !== 1) kit.fail('reload-button-not-working', 'no Eve is working… button');
+  await shots.reload();
+  if (fixture.judge.calls !== 1) kit.fail('duplicate-admission', `judge calls ${fixture.judge.calls}`);
+  kit.pass('single-admission-after-reload', fixture.judge.calls);
+  fixture.judge.release(PROPOSAL_OK);
+  await page.getByRole('heading', { name: 'Confirm the normalization priority' }).waitFor({ timeout: 20000 });
+  await expectAgreement(page, 'awaiting_decision', 'after-release', kit, timeline);
+  await shots.awaiting();
+  await page.getByRole('button', { name: 'Approve commitment' }).click();
+  await page.getByText('Committed', { exact: true }).first().waitFor({ timeout: 20000 });
+  await expectAgreement(page, 'completed', 'after-approval', kit, timeline);
+  if (!/Next: work on: Confirm the normalization priority/.test(await page.locator('p.summary').innerText())) kit.fail('completed-next-step', 'missing work on');
+  await shots.completed();
+  if (fixture.judge.calls !== 1) kit.fail('duplicate-admission', `judge calls ${fixture.judge.calls}`);
+  return kit.assertions;
+}
+
+async function scenarioProgressBlocked({ fixture, page, shots, timeline }) {
+  const kit = assertionKit();
+  await login(page, fixture);
+  fixture.judge.hold();
+  await page.getByLabel('Request to Eve').fill('Please advise on the next step.');
+  const called = fixture.judge.waitUntilCalled({ timeoutMs: 20000 });
+  await page.getByRole('button', { name: 'Ask Eve' }).click();
+  await called;
+  await expectAgreement(page, 'working', 'blocked-scenario-working', kit, timeline);
+  fixture.judge.releaseHeld();
+  await page.getByText('Needs operator review').first().waitFor({ timeout: 20000 });
+  await expectAgreement(page, 'blocked', 'after-held', kit, timeline);
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await page.getByText('YOUR WORKSPACE').waitFor({ timeout: 20000 });
+  await expectAgreement(page, 'blocked', 'held-after-reload', kit, timeline);
+  await shots.blocked();
+  return kit.assertions;
+}
+
+async function runScenario({ name, evidenceDir, secrets, scenarios, scenarioFailures, cleanupResults, failureShot, body }) {
+  const { cleanup } = await withFixture(evidenceDir, async ({ fixture, browser }) => {
+    secrets.push(fixture.getOwnerLogin().email, fixture.getOwnerLogin().password, fixture._credentials.secret);
+    const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+    const routeFailures = [];
+    await installBrowserRoute(context, fixture, routeFailures);
+    const page = await context.newPage();
+    const sc = { name, startedAt: phxNow(), ok: false, assertions: [], timeline: [], error: null, durationMs: 0 };
+    const t0 = Date.now();
+    try {
+      sc.assertions = await body({ fixture, page, timeline: sc.timeline });
+      if (routeFailures.length) throw new Error(`network-boundary:${routeFailures.join(';')}`);
+      if (fixture.blockedBrowser.length || fixture.blockedNode.length) throw new Error(`blocked-network:${JSON.stringify([...fixture.blockedBrowser, ...fixture.blockedNode])}`);
+      sc.ok = sc.assertions.every(a => a.ok);
+    } catch (e) {
+      sc.error = String(e.message || e); sc.ok = false;
+      try { await page.screenshot({ path: join(evidenceDir, failureShot), fullPage: true }); } catch { /* ignore */ }
+    } finally {
+      sc.durationMs = Date.now() - t0; sc.finishedAt = phxNow(); sc.judgeCalls = fixture.judge.calls;
+      scenarios.push(sc);
+      await context.close();
+    }
+    if (!sc.ok) scenarioFailures.push(sc.error || sc.name);
+  });
+  cleanupResults.push({ scenario: name, ...cleanup });
+}
+
 async function runOnce({ evidenceDir, netnsReported }) {
   const started = Date.now();
   const headSha = await gitSha(repoRoot);
@@ -326,6 +479,15 @@ async function runOnce({ evidenceDir, netnsReported }) {
     });
     cleanupResults.push({ scenario: 'blocked-request', ...cleanup });
   }
+
+  // Progress consistency — every status surface agrees through the request, each on a fresh fixture
+  const shared = { evidenceDir, secrets, scenarios, scenarioFailures, cleanupResults };
+  const shot = (page, file) => () => page.screenshot({ path: join(evidenceDir, file), fullPage: true });
+  await runScenario({ ...shared, name: 'progress-consistency-working', failureShot: '05-failure.png', body: ({ fixture, page, timeline }) => scenarioProgressWorking({ fixture, page, timeline, shots: {
+    working: shot(page, '05-working-immediately.png'), reload: shot(page, '06-working-after-reload.png'),
+    awaiting: shot(page, '07-awaiting-decision.png'), completed: shot(page, '08-completed-next-step.png') } }) });
+  await runScenario({ ...shared, name: 'progress-consistency-blocked', failureShot: '09-failure.png', body: ({ fixture, page, timeline }) => scenarioProgressBlocked({ fixture, page, timeline, shots: {
+    blocked: shot(page, '09-blocked-next-step.png') } }) });
 
   const report = {
     generatedAt: phxNow(),
