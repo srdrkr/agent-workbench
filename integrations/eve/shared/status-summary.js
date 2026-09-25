@@ -41,6 +41,26 @@ const GITHUB = {
   not_found: 'no GitHub result recorded yet',
 };
 const UNMERGED = ['tested_draft_pr', 'needs_review', 'branch_without_pr', 'conflicting_prs'];
+// Outcome-1 follow-up: a held record may carry the server's recovery classification
+// (hosted/recovery.js). Only its case, action and who-acts fields are used here.
+const HELD_CASE = {
+  confirmed_rejection: 'provider refused a held attempt',
+  expired_authority: 'provider refused a held attempt; its authority expired',
+  allowance_exhausted: 'provider refused a held attempt; allowance exhausted',
+  uncertain_delivery: 'held attempt outcome unknown',
+  unverified_output: 'held attempt output not verified',
+  unclassified: 'held attempt cannot be classified safely',
+};
+function heldNext(held) {
+  const r = held.recovery;
+  if (!r) return 'review the held attempt';
+  if (r.action === 'acknowledge') return 'acknowledge the failed review in the web app, then start a fresh request';
+  if (held.retryReviewHash) return 'retry the refused request once in the web app';
+  if (r.case === 'uncertain_delivery') return 'operator: check provider usage for the held attempt; do not resend';
+  if (/follow-through/i.test(r.whoActs ?? '')) return 'wait for follow-through to stop the task, then acknowledge';
+  if (/operator/i.test(r.whoActs ?? '')) return 'operator: check the held attempt; do not resend';
+  return 'review the held attempt';
+}
 const CONTINUATION = {
   CONTINUATION_CONTEXT_CHANGED: 'brief changed after the follow-up was approved',
   CONTINUATION_SOURCE_EXPIRED: 'reviewed coding result expired',
@@ -75,6 +95,7 @@ function facts(view, options = {}) {
     v, job, held, thinking, stalled, jobOpen, failedStart,
     needsContext: newest?.status === 'needs_context' ? newest : null,
     notSent: newest?.status === 'not_sent' ? newest : null,
+    acknowledged: newest?.status === 'rejection_acknowledged' ? newest : null,
     startUnconfirmed: jobOpen && dispatch !== 'accepted' && !['running', 'exited', 'stopped'].includes(execution),
     running: jobOpen && execution === 'running',
     ended: jobOpen && ['exited', 'stopped'].includes(execution),
@@ -118,7 +139,7 @@ function blocker({ v, held, thinking, stalled, job, jobOpen, failedStart, startU
   if (dollarsExhausted) return [`model allowance used up (${usd(v.reservedMicros)} of ${usd(v.budgetMicros)} reserved)`, ''];
   if (attemptsExhausted) return [`request limit reached (${v.providerAttempts} of ${v.maxProviderAttempts} attempts)`, ''];
   if (stalled) return ['no result recorded from Eve; outcome unknown', ''];
-  if (held) return ['a held model attempt needs review', ''];
+  if (held) return [HELD_CASE[held.recovery?.case] ?? 'a held model attempt needs review', ''];
   if (startUnconfirmed) return ['coding start unconfirmed; check Claude first', ''];
   if (failedStart && !job.releasedAt) return [job.dispatch === 'usage_limited' ? 'Claude usage limit; coding did not start' : 'coding dispatch rejected', ''];
   if (jobOpen && job.stopRequested) return ['coding paused; stop requested, not confirmed', ''];
@@ -145,7 +166,11 @@ function next(f) {
   if (thinking) return ['wait for Eve\'s answer; no need to send the request again', '', 'working'];
   if (v.contextFresh === false) return ['update the project brief', '', 'blocked'];
   if (stalled) return ['ask the operator to check the stalled request; do not resend it', '', 'blocked'];
-  if (held) return ['review the held attempt', '', 'blocked'];
+  if (held) return [heldNext(held), '', 'blocked'];
+  // An acknowledged failed review of the stopped task: the PR is still unreviewed; nothing is retried.
+  if (f.acknowledged && v.followThrough?.status === 'blocked' && f.acknowledged.taskId === v.followThrough.taskId) {
+    return ['review the PR yourself or start a fresh request; the failed review stays in history', '', 'awaiting_decision'];
+  }
   const follow = v.followThrough && followThroughNotice(v.followThrough);
   if (follow) return ['', follow, ['blocked', 'waiting_for_connection'].includes(v.followThrough.status) ? 'blocked' : 'awaiting_decision'];
   if (jobOpen) {
@@ -166,6 +191,7 @@ function next(f) {
   if (awaiting) return [awaiting.proposal.kind === 'coding' ? 'review the coding assignment: ' : 'decide on the proposal: ', awaiting.proposal.title, 'awaiting_decision'];
   if (needsContext) return ['answer Eve\'s question in a new request: ', needsContext.proposal?.question ?? needsContext.proposal?.title ?? '', 'awaiting_decision'];
   if (notSent) return ['check the allowance and brief size, then ask again', '', 'blocked'];
+  if (f.acknowledged) return ['start a fresh request; the failed review stays in history', '', 'ready'];
   if (v.continuationAvailable) return ['review the next Eve request', '', 'awaiting_decision'];
   if (open) return ['work on: ', open.title, 'completed', 'Decision recorded'];
   const finished = done || (job && job.releasedAt && result === 'merged_pr') ? 'completed' : 'ready';

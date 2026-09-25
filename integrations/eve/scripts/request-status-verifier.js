@@ -260,6 +260,9 @@ async function scenarioRejectedReviewRecovery({ fixture, page, shots }) {
   pass('ask-blocked-while-held', true);
   if (await page.getByRole('button', { name: 'Retry this request once' }).count()) fail('coding-review-must-not-offer-retry', 'retry shown');
   pass('no-proposal-retry-for-coding-review', true);
+  const heldSummary = await page.locator('p.summary[data-owner-state="blocked"]').innerText().catch(() => '');
+  if (!/Next: acknowledge the failed review in the web app, then start a fresh request/.test(heldSummary)) fail('summary-disagrees-with-handoff', heldSummary);
+  pass('summary-agrees-with-handoff', heldSummary);
   await shots.held();
   const ack = page.getByRole('button', { name: 'Acknowledge failed review' });
   try { await ack.waitFor({ timeout: 10000 }); } catch { fail('missing-acknowledge-control', 'Acknowledge failed review button absent'); }
@@ -284,6 +287,9 @@ async function scenarioRejectedReviewRecovery({ fixture, page, shots }) {
   catch { fail('acknowledgement-not-persisted', 'label missing after reload'); }
   if (await page.getByRole('button', { name: 'Acknowledge failed review' }).count()) fail('acknowledge-still-offered', 'after reload');
   pass('acknowledgement-persisted-after-reload', true);
+  const readySummary = await page.locator('p.summary[data-owner-state="awaiting_decision"]').innerText().catch(() => '');
+  if (!/Next: review the PR yourself or start a fresh request; the failed review stays in history/.test(readySummary)) fail('summary-disagrees-after-acknowledge', readySummary);
+  pass('summary-agrees-after-acknowledge', readySummary);
   const fresh = page.getByRole('button', { name: 'Start a fresh request' });
   try { await fresh.waitFor({ timeout: 10000 }); } catch { fail('missing-next-step', 'Start a fresh request button absent'); }
   await fresh.click();
@@ -321,6 +327,9 @@ async function scenarioUncertainReviewBlocked({ fixture, page, shots }) {
   if (await page.getByRole('button', { name: 'Retry this request once' }).count()) fail('uncertain-must-not-offer-retry', 'shown');
   if (!(await page.getByLabel('Request to Eve').isDisabled())) fail('uncertain-must-block-new-requests', 'ask enabled');
   pass('uncertain-offers-no-recovery-and-blocks-requests', true);
+  const uncertainSummary = await page.locator('p.summary[data-owner-state="blocked"]').innerText().catch(() => '');
+  if (!/Next: operator: check provider usage for the held attempt; do not resend/.test(uncertainSummary)) fail('summary-disagrees-with-uncertain-handoff', uncertainSummary);
+  pass('summary-agrees-with-uncertain-handoff', uncertainSummary);
   await shots.uncertain();
   const callsBefore = fixture.modelCalls();
   const direct = await page.evaluate(async id => {
@@ -374,7 +383,7 @@ function agreement(s, key) {
     if (!/committed/i.test(s.cards[0]?.tag ?? '')) problems.push(`newest card is ${s.cards[0]?.tag}`);
   }
   if (key === 'blocked') {
-    if (!/^State: Blocked\./.test(s.summary) || !/Next: review the held attempt/.test(s.summary)) problems.push('summary not blocked with next step');
+    if (!/^State: Blocked\./.test(s.summary) || !/Next: (review the held attempt|operator: |acknowledge the failed review)/.test(s.summary)) problems.push('summary not blocked with next step');
     if (!/needs review/.test(s.askNotice ?? '')) problems.push('ask notice does not name the held attempt');
     if (!/needs operator review/i.test(s.cards[0]?.tag ?? '')) problems.push(`newest card is ${s.cards[0]?.tag}`);
   }

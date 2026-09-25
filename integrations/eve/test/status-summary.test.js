@@ -251,7 +251,8 @@ test('exhausted allowance keeps unresolved work ahead of a blocked allowance rev
     assert.equal(request.status, 'held');
     const p = parts(await w.summary());
     assert.match(p.Blocker, limit === 'dollars' ? /allowance used up/ : /request limit reached/);
-    assert.equal(p.Next, 'review the held attempt');
+    // With the outcome-1 recovery projection this held proposal (2xx, no verified result) is unverified output.
+    assert.equal(p.Next, 'operator: check the held attempt; do not resend');
   }
   const w = workspace();
   w.state.reservedMicros = w.state.budgetMicros;
@@ -332,7 +333,11 @@ test('terminal request outcomes each point to their next action', async () => {
 
   const held = workspace({ judge: async () => { throw new Error('synthetic gateway failure'); } });
   assert.equal((await held.steward.propose(ask())).status, 'held');
-  r = both(await held.steward.view()); assert.equal(r.key, 'blocked'); assert.equal(r.p.Next, 'review the held attempt');
+  r = both(await held.steward.view()); assert.equal(r.key, 'blocked'); assert.equal(r.p.Next, 'operator: check the held attempt; do not resend');
+  assert.equal(r.p.Blocker, 'held attempt output not verified');
+  // Without a recovery projection (a view from before outcome 1) the generic text remains.
+  const plain = await held.steward.view(); plain.requests = plain.requests.map(({ recovery, ...rest }) => rest);
+  assert.equal(both(plain).p.Next, 'review the held attempt');
 });
 
 test('the four owner states are distinct and stay within 280 characters with the link', async () => {
