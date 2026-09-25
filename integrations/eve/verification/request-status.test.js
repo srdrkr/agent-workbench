@@ -23,7 +23,7 @@ test('verify:request-status browser command exits 0 and writes scrubbed report',
   const report = JSON.parse(await readFile(join(evidence, 'report.json'), 'utf8'));
   assert.equal(report.ok, true);
   assert.ok(report.scenarios.every(s => s.ok));
-  assert.deepEqual(report.scenarios.map(s => s.name), ['start-finish-request', 'blocked-request', 'held-rejected-review-recovery', 'held-uncertain-review-blocked']);
+  assert.deepEqual(report.scenarios.map(s => s.name), ['start-finish-request', 'blocked-request', 'held-rejected-review-recovery', 'held-uncertain-review-blocked', 'progress-consistency-working', 'progress-consistency-blocked']);
   assert.equal(report.secretsScrubNote.includes('never written'), true);
   const scrub = JSON.parse(await readFile(join(evidence, 'scrub-check.json'), 'utf8'));
   assert.equal(scrub.leaks.length, 0);
