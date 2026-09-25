@@ -1,6 +1,7 @@
 import { followThroughGrant } from './follow-through.js';
 import { createHash } from 'node:crypto';
 import { validatedSpec } from '../../../src/task-policy.js';
+import { assignmentProvenance } from './assignment-draft.js';
 import { fireRoutine, repositoryPreflight, collectEvidence, githubReader, sessionReference } from '../../../src/providers.js';
 const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const need = (value, code) => { if (!value) throw new Error(code); };
@@ -49,10 +50,13 @@ export class HostedCoding {
     return ['repository', 'visibility', 'routineId', 'baseBranch', 'mode'].every(k => spec[k] === fixed[k])
       && hash(spec.requiredChecks) === hash(fixed.requiredChecks);
   }
-  async prepare({ requestId, fromRequestId, objective, acceptance, allowedPaths, expectedContextRevision }) {
+  async prepare({ requestId, fromRequestId, supersedes, objective, acceptance, allowedPaths, expectedContextRevision }) {
     need(this.enabled() && this.config.repeatable, 'CODING_NOT_ENABLED');
-    need(typeof requestId === 'string' && /^[a-z0-9][a-z0-9-]{0,63}$/.test(requestId) && (fromRequestId === undefined || typeof fromRequestId === 'string'), 'INVALID_REQUEST');
-    const draftHash = hash({ objective, acceptance, allowedPaths, expectedContextRevision, fromRequestId });
+    need(typeof requestId === 'string' && /^[a-z0-9][a-z0-9-]{0,63}$/.test(requestId) && (fromRequestId === undefined || typeof fromRequestId === 'string')
+      && (supersedes === undefined || (typeof supersedes === 'string' && supersedes !== requestId)), 'INVALID_REQUEST');
+    // An edit is a new exact assignment. `supersedes` is part of its identity so an
+    // edited retry can never collide with, or revive, the earlier reviewed version.
+    const draftHash = hash({ objective, acceptance, allowedPaths, expectedContextRevision, fromRequestId, ...(supersedes === undefined ? {} : { supersedes }) });
     const previous = own((await this.store.read()).requests, requestId);
     if (previous) { need(previous.source === 'authenticated_owner_assignment' && previous.draftHash === draftHash, 'REQUEST_ID_CONFLICT'); return this.review({ requestId, proposalHash: previous.proposalHash }); }
     const base = await this.read(`/repos/${this.config.spec.repository}/commits/${this.config.spec.baseBranch}`);
@@ -65,18 +69,31 @@ export class HostedCoding {
       const existing = own(state.requests, id);
       if (existing) { need(existing.source === 'authenticated_owner_assignment' && existing.draftHash === draftHash, 'REQUEST_ID_CONFLICT'); return existing; }
       const source = fromRequestId === undefined ? null : own(state.requests, fromRequestId);
-      if (fromRequestId !== undefined) need(source?.proposal?.kind === 'plan' && source.status === 'awaiting_approval' && source.contextRevision === state.project.revision, 'APPROVAL_MISMATCH');
+      const earlier = supersedes === undefined ? null : own(state.requests, supersedes);
+      if (earlier) {
+        // Only a prepared, never-dispatched assignment from the same plan can be replaced.
+        need(earlier.source === 'authenticated_owner_assignment' && earlier.status === 'awaiting_approval'
+          && !own(control(state).jobs, supersedes) && earlier.fromRequestId === fromRequestId, 'APPROVAL_MISMATCH');
+      } else need(supersedes === undefined, 'APPROVAL_MISMATCH');
+      if (fromRequestId !== undefined) need(source?.proposal?.kind === 'plan' && source.contextRevision === state.project.revision
+        && (earlier ? source.status === 'assignment_prepared' && source.assignmentRequestId === supersedes : source.status === 'awaiting_approval'), 'APPROVAL_MISMATCH');
       need(state.pilot && state.project.revision === expectedContextRevision && fresh(state.project, this.now()), 'APPROVAL_MISMATCH');
       need(!state.paused && !control(state).paused && !unresolved(control(state)) && Object.keys(state.requests).length < 500, 'CODING_ADMISSION_PAUSED');
       const project = structuredClone(state.project);
       project.codingCandidates = [{ id: spec.taskId, title: objective.slice(0, 160), sourceIds: [project.sources[0].id], spec }];
-      const proposal = { kind: 'coding', candidateId: spec.taskId, title: objective.slice(0, 240), rationale: acceptance.slice(0, 2000), citations: [project.sources[0].id], question: null };
-      const record = { id, draftHash, ...(fromRequestId ? { fromRequestId } : {}), source: 'authenticated_owner_assignment', projectId: state.project.id,
+      const proposal = { kind: 'coding', candidateId: spec.taskId, title: objective.split('\n')[0].slice(0, 240), rationale: acceptance.slice(0, 2000), citations: [project.sources[0].id], question: null };
+      const record = { id, draftHash, ...(fromRequestId ? { fromRequestId } : {}), ...(earlier ? { supersedes } : {}), source: 'authenticated_owner_assignment', projectId: state.project.id,
         message: 'Owner prepared a coding assignment', contextRevision: state.project.revision, contextSnapshot: project,
         status: 'awaiting_approval', createdAt: this.now(), proposal,
-        proposalHash: hash({ projectId: state.project.id, contextRevision: state.project.revision, proposal }) };
+        proposalHash: hash({ projectId: state.project.id, contextRevision: state.project.revision, proposal }),
+        provenance: assignmentProvenance(spec, state.project, source) };
       state.requests[id] = record;
       if (source) { source.status = 'assignment_prepared'; source.assignmentRequestId = id; }
+      if (earlier) {
+        // The earlier review can no longer match: approval must equal what is dispatched.
+        earlier.status = 'superseded'; earlier.supersededBy = id; earlier.supersededAt = this.now(); delete earlier.codingReview;
+        event(state, 'coding_assignment_superseded', { requestId: supersedes, supersededBy: id }, this.now());
+      }
       event(state, 'coding_assignment_prepared', { requestId: id, scopeHash: hash(spec) }, this.now()); return record;
     });
     return this.review({ requestId: record.id, proposalHash: record.proposalHash });

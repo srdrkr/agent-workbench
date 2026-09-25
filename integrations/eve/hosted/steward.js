@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { attemptLimit, continuationPacket, reviewContinuation, approveContinuation, judgmentProject } from './continuation.js';
 import { previewContext, applyContext } from './context.js';
 import { validateProject, validateProposal } from '../../../src/steward-policy.js';
+import { validateAssignmentDraft } from './assignment-draft.js';
 
 export const digest = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 export const fresh = (project, now) => project.sources.every(s => Date.parse(s.observedAt) <= Date.parse(now) && Date.parse(s.expiresAt) > Date.parse(now));
@@ -58,10 +59,12 @@ export class HostedSteward {
       budgetMicros: state.budgetMicros, reservedMicros: state.reservedMicros, paused: state.paused,
       codingEnabled: Boolean(this.coding?.enabled()), codingJobs: Object.values(state.coding?.jobs ?? {}), codingPaused: Boolean(state.coding?.paused) };
   }
-  async propose({ requestId, projectId, message, expectedContextRevision, retryOf, rejectionHash }) {
-    requireValue(validId(requestId) && typeof projectId === 'string' && typeof message === 'string' && message.trim() && message.length <= 2000, 'INVALID_REQUEST');
+  async propose({ requestId, projectId, message, expectedContextRevision, retryOf, rejectionHash, mode }) {
+    requireValue(validId(requestId) && typeof projectId === 'string' && typeof message === 'string' && message.trim() && message.length <= 2000
+      && (mode === undefined || mode === 'assignment_draft'), 'INVALID_REQUEST');
     requireValue((retryOf === undefined && rejectionHash === undefined) || (validId(retryOf) && typeof rejectionHash === 'string' && /^[a-f0-9]{64}$/.test(rejectionHash)), 'INVALID_REQUEST');
-    const inputHash = digest({ projectId, message });
+    // Drafting is part of the request identity; ordinary requests hash exactly as before.
+    const inputHash = digest({ projectId, message, ...(mode ? { mode } : {}) });
     const start = await this.store.change(state => {
       const existing = Object.hasOwn(state.requests, requestId) ? state.requests[requestId] : undefined;
       if (existing) { requireValue(existing.inputHash === inputHash && existing.retryOf === retryOf && existing.rejectionHash === rejectionHash, 'REQUEST_ID_CONFLICT'); return { existing }; }
@@ -83,10 +86,10 @@ export class HostedSteward {
       requireValue(state.project.sources.every(s => s.exposure === 'model_allowed'), 'CONTEXT_NOT_APPROVED');
       const commitments = Object.values(state.commitments).filter(c => !c.completedAt && c.contextRevision === state.project.revision);
       const project = judgmentProject(state, this.now());
-      const input = { request: message, project, commitments, hostedRequestId: requestId };
+      const input = { request: message, project, commitments, hostedRequestId: requestId, ...(mode ? { mode } : {}) };
       requireValue(Buffer.byteLength(JSON.stringify(input)) <= 32768, 'CONTEXT_TOO_LARGE');
       const record = { id: requestId, inputHash, projectId, message, contextRevision: state.project.revision,
-        contextSnapshot: project, judge: state.model, status: 'thinking', createdAt: this.now(), inputDigest: digest(input) };
+        contextSnapshot: project, judge: state.model, status: 'thinking', createdAt: this.now(), inputDigest: digest(input), ...(mode ? { mode } : {}) };
       if (failed) {
         record.retryOf = retryOf; record.rejectionHash = rejectionHash;
         failed.retryRequestId = requestId;
@@ -104,9 +107,17 @@ export class HostedSteward {
       try {
         requireValue(proposal && record.provider?.intentAt && record.provider.sessionId && record.provider.reservedMicros > 0
           && state.reservedMicros >= record.provider.reservedMicros && record.provider.httpStatus >= 200 && record.provider.httpStatus < 300, 'NO_VERIFIED_PROVIDER_RESULT');
-        validateProposal(proposal, record.contextSnapshot);
-        record.proposal = proposal;
-        record.proposalHash = digest({ projectId, contextRevision: record.contextRevision, proposal });
+        // The optional assignment draft is validated separately; the proposal (and its
+        // hash) keeps the existing strict shape. Semantic draft problems are flagged,
+        // not fatal; a malformed draft invalidates the output like any malformed field.
+        const { draft = null, ...core } = proposal;
+        validateProposal(core, record.contextSnapshot);
+        if (draft !== null && record.mode !== 'assignment_draft') record.draftIgnored = 'not_requested';
+        else if (draft !== null && core.kind === 'plan') {
+          record.assignmentDraft = validateAssignmentDraft(draft, { project: record.contextSnapshot, request: record.message, proposal: core });
+        } else if (draft !== null) record.draftIgnored = 'not_a_plan';
+        record.proposal = core;
+        record.proposalHash = digest({ projectId, contextRevision: record.contextRevision, proposal: core });
         record.status = proposal.kind === 'clarify' ? 'needs_context' : 'awaiting_approval';
       } catch {
         record.status = record.provider?.intentAt ? 'held' : 'not_sent';

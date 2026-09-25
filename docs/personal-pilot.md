@@ -8,6 +8,19 @@ Steward supplies the configured repository, visibility, Routine, required checks
 
 When Claude finishes, use **Confirm Claude finished**. Paste its session link if it was not recognized, verify the task marker, and confirm Finished or Stopped. Steward saves the owner observation, checks GitHub and closes the run in order. A PR, passing checks or merge alone cannot prove that the provider session stopped. There is no supported provider-read capability in the Routine trigger token.
 
+### Assignment drafts
+
+Tick **Draft a coding assignment I can review and edit** when you ask Eve. This uses the same single judgment call with a larger bounded output shape (`assignment_draft`). Ordinary requests keep their schema, reservation size and eval fixtures unchanged. When Eve returns a plan, it may include a draft with source references, suggested files, acceptance examples and verification steps. Steward treats all of these as untrusted:
+
+- Source references must be IDs in the request's approved context snapshot. Sources Eve cited for the plan are added back if the draft leaves them out.
+- A suggested file is used only when it is an exact relative path that the approved context itself names, either in a brief source's text or in an approved coding candidate. Steward does not read the repository to check this. Anything else is shown as a flagged suggestion and is not prefilled.
+- The outcome is your request, word for word. The approved text of each referenced source goes into the assignment in full, never shortened.
+- If no suggested file can be verified, or the referenced context is too long for one assignment, the draft asks one focused question. A missing or contradictory fact makes Eve ask one question (`clarify`) instead of drafting. Eve is told not to ask you to reconfirm a priority the brief already settles.
+
+**Review Eve's draft assignment** opens the existing editable form. Nothing is sent to Claude while you review or edit it, or while you prepare it. Dispatch still needs **Approve and start Claude** on the exact prepared review. **Edit assignment** on a prepared review creates a replacement. The earlier version becomes *Replaced by an edited assignment*, and its review can no longer be approved, so the approval always matches what is sent. The review shows whether your original outcome is still included, whether you edited Eve's draft, and any allowed file that the approved context does not name. An expired brief blocks drafting, preparing and approving.
+
+Fixtures and tests show how Steward handles drafts. They do not show that Eve drafts well. Model quality remains unevaluated until an authorized live evaluation.
+
 ## Allowance and controls
 
 **Review pilot allowance** sets a cumulative model-dollar cap (maximum $10 in this version) and total attempt limit (maximum 250). Existing reservations and attempts are retained; changing the brief does not reset either. No automatic top-up, provider fallback or Claude paid overage is enabled. The amount shown is conservatively reserved allowance, not billed cost.
