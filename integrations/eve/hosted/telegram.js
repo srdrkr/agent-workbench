@@ -59,7 +59,7 @@ export class TelegramChannel {
         reply = 'Send a question about the approved project brief. /status shows a short project status; /pause stops new model requests. Review and approve commitments in the web app. Coding availability is shown in the web app.';
       } else if (text === '/status') {
         // The same summary the web view shows, already within 280 characters including the link.
-        reply = statusSummary(await this.steward.view(), { link: this.config.origin }); complete = true;
+        reply = statusSummary(await this.steward.view(), { link: this.config.origin, state: true }); complete = true;
       } else if (text === '/pause') {
         await this.steward.pause(); reply = 'New model requests are paused. An already-started request may still complete.';
       } else if (text.startsWith('/')) {

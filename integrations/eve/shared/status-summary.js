@@ -10,8 +10,17 @@ import { followThroughNotice } from './follow-through-notice.js';
  * as more certain than the record supports: a draft PR is not a merge, a merge
  * is not a deployment, a GitHub result never proves the Claude session ended,
  * and "working" is only said when the owner recorded the session as running.
+ *
+ * Owner state: every Next branch also names one state, so the state and the next
+ * step can never disagree: working (a recorded request or observed session is in
+ * progress), awaiting_decision, blocked, completed, or ready (nothing recorded).
  */
 export const STATUS_SUMMARY_LIMIT = 280;
+// A hosted request cannot outlive its function limit (90 s). A thinking record older
+// than this has stopped without recording an outcome; it is shown as stalled, never
+// as still working. Display only: the record itself is not changed.
+export const STALLED_AFTER_MS = 5 * 60_000;
+export const OWNER_STATES = Object.freeze({ working: 'In progress', awaiting_decision: 'Your decision needed', blocked: 'Blocked', completed: 'Completed', ready: 'Ready' });
 const MIN_DETAIL = 24;
 
 const clip = (text, max) => {
@@ -38,8 +47,9 @@ const CONTINUATION = {
   CONTINUATION_UNAVAILABLE: 'coding run must close before continuing',
 };
 
-function facts(view) {
+function facts(view, options = {}) {
   const v = view && typeof view === 'object' ? view : {};
+  const nowMs = Date.parse(options.now ?? v.observedAt ?? '');
   const revision = v.project?.revision;
   const current = list(v.requests).filter(r => !r.contextRevision || revision === undefined || r.contextRevision === revision);
   // The progress view is already scoped to the active project by the application,
@@ -55,10 +65,16 @@ function facts(view) {
   const dispatch = job?.dispatch; const execution = job?.execution;
   const failedStart = ['rejected', 'usage_limited'].includes(dispatch);
   const held = current.find(r => r.status === 'held') ?? null;
-  const thinking = current.find(r => r.status === 'thinking') ?? null;
+  const pending = current.find(r => r.status === 'thinking') ?? null;
+  // A local (not yet refreshed) submission is never stalled; a recorded one is judged by server time.
+  const stalled = pending && requestStalled(pending, Number.isFinite(nowMs) ? new Date(nowMs).toISOString() : undefined) ? pending : null;
+  const thinking = stalled ? null : pending;
+  const newest = latest(current, 'createdAt');
   const jobOpen = Boolean(job && !job.releasedAt && !failedStart);
   return {
-    v, job, held, thinking, jobOpen, failedStart,
+    v, job, held, thinking, stalled, jobOpen, failedStart,
+    needsContext: newest?.status === 'needs_context' ? newest : null,
+    notSent: newest?.status === 'not_sent' ? newest : null,
     startUnconfirmed: jobOpen && dispatch !== 'accepted' && !['running', 'exited', 'stopped'].includes(execution),
     running: jobOpen && execution === 'running',
     ended: jobOpen && ['exited', 'stopped'].includes(execution),
@@ -95,71 +111,94 @@ function progress({ job, jobOpen, failedStart, startUnconfirmed, running, ended,
   return ['no recorded progress yet', ''];
 }
 
-function blocker({ v, held, thinking, job, jobOpen, failedStart, startUnconfirmed, dollarsExhausted, attemptsExhausted }) {
+function blocker({ v, held, thinking, stalled, job, jobOpen, failedStart, startUnconfirmed, notSent, dollarsExhausted, attemptsExhausted }) {
   if (v.continuationProblem) return [CONTINUATION[v.continuationProblem] ?? 'continuation needs operator review', ''];
   if (v.paused) return ['new model requests paused', ''];
   if (v.contextFresh === false) return ['project brief expired', ''];
   if (dollarsExhausted) return [`model allowance used up (${usd(v.reservedMicros)} of ${usd(v.budgetMicros)} reserved)`, ''];
   if (attemptsExhausted) return [`request limit reached (${v.providerAttempts} of ${v.maxProviderAttempts} attempts)`, ''];
+  if (stalled) return ['no result recorded from Eve; outcome unknown', ''];
   if (held) return ['a held model attempt needs review', ''];
   if (startUnconfirmed) return ['coding start unconfirmed; check Claude first', ''];
   if (failedStart && !job.releasedAt) return [job.dispatch === 'usage_limited' ? 'Claude usage limit; coding did not start' : 'coding dispatch rejected', ''];
   if (jobOpen && job.stopRequested) return ['coding paused; stop requested, not confirmed', ''];
   if (v.monitor?.lastError) return ['GitHub check unavailable; older result shown', ''];
-  if (thinking) return ['waiting for Eve', ''];
+  if (thinking) return ['none; Eve is working on your request', ''];
   if (job?.result?.result === 'conflicting_prs') return ['several PRs match one task', ''];
+  if (notSent) return ['the last request was not sent', ''];
   return ['none recorded', ''];
 }
 
+// Returns [fixed text, detail, owner state]. The state comes from the same branch as the text.
 function next(f) {
-  const { v, held, thinking, job, jobOpen, failedStart, startUnconfirmed, running, ended, awaiting, open, priority, dollarsExhausted, attemptsExhausted } = f;
+  const { v, held, thinking, stalled, job, jobOpen, failedStart, startUnconfirmed, running, ended, awaiting, needsContext, notSent, open, done, priority, dollarsExhausted, attemptsExhausted } = f;
   const result = job?.result?.result;
-  if (v.continuationProblem) return ['review continuation in the web app', ''];
+  if (v.continuationProblem) return ['review continuation in the web app', '', 'blocked'];
   if (v.paused) {
-    if (held) return ['review the held attempt before resuming', ''];
-    if (thinking) return ['wait for Eve before resuming', ''];
-    if (jobOpen) return [ended ? 'close the coding run before resuming' : 'check Claude and close the run before resuming', ''];
-    return ['resume requests when ready', ''];
+    if (held) return ['review the held attempt before resuming', '', 'blocked'];
+    if (stalled) return ['ask the operator to check the stalled request before resuming', '', 'blocked'];
+    if (thinking) return ['wait for Eve before resuming', '', 'working'];
+    if (jobOpen) return [ended ? 'close the coding run before resuming' : 'check Claude and close the run before resuming', '', 'blocked'];
+    return ['resume requests when ready', '', 'blocked'];
   }
-  if (v.contextFresh === false) return ['update the project brief', ''];
-  if (held) return ['review the held attempt', ''];
-  if (thinking) return ['wait for Eve, then review the proposal', ''];
+  // A request in progress comes first: the brief cannot change and nothing else can be admitted until it ends.
+  if (thinking) return ['wait for Eve\'s answer; no need to send the request again', '', 'working'];
+  if (v.contextFresh === false) return ['update the project brief', '', 'blocked'];
+  if (stalled) return ['ask the operator to check the stalled request; do not resend it', '', 'blocked'];
+  if (held) return ['review the held attempt', '', 'blocked'];
   const follow = v.followThrough && followThroughNotice(v.followThrough);
-  if (follow) return ['', follow];
+  if (follow) return ['', follow, ['blocked', 'waiting_for_connection'].includes(v.followThrough.status) ? 'blocked' : 'awaiting_decision'];
   if (jobOpen) {
-    if (startUnconfirmed) return ['check Claude, then confirm or close the run', ''];
-    if (ended) return [result === 'tested_draft_pr' ? 'close the coding run, then review the draft PR' : 'check GitHub, then close the coding run', ''];
-    if (running) return ['wait for Claude; check GitHub later', ''];
-    if (result === 'tested_draft_pr') return ['confirm Claude finished, then review the draft PR', ''];
-    if (result === 'merged_pr') return ['confirm Claude finished and close the run', ''];
-    if (result === 'needs_review' || result === 'conflicting_prs') return ['review the PR state, then confirm Claude finished', ''];
-    return ['wait for GitHub progress; confirm when Claude finishes', ''];
+    if (startUnconfirmed) return ['check Claude, then confirm or close the run', '', 'blocked'];
+    if (ended) return [result === 'tested_draft_pr' ? 'close the coding run, then review the draft PR' : 'check GitHub, then close the coding run', '', 'awaiting_decision'];
+    if (running) return ['wait for Claude; check GitHub later', '', 'working'];
+    if (result === 'tested_draft_pr') return ['confirm Claude finished, then review the draft PR', '', 'awaiting_decision'];
+    if (result === 'merged_pr') return ['confirm Claude finished and close the run', '', 'awaiting_decision'];
+    if (result === 'needs_review' || result === 'conflicting_prs') return ['review the PR state, then confirm Claude finished', '', 'awaiting_decision'];
+    return ['wait for GitHub progress; confirm when Claude finishes', '', 'working'];
   }
   if (job && !failedStart && UNMERGED.includes(result)) {
-    return [result === 'branch_without_pr' ? 'check the pushed branch; no PR yet' : result === 'conflicting_prs' ? 'resolve the several matching PRs' : 'review the unmerged PR', ''];
+    return [result === 'branch_without_pr' ? 'check the pushed branch; no PR yet' : result === 'conflicting_prs' ? 'resolve the several matching PRs' : 'review the unmerged PR', '', 'awaiting_decision'];
   }
-  if (failedStart && !job.releasedAt) return ['review the failed coding start in the web app', ''];
-  if (dollarsExhausted) return ['review the pilot allowance; no automatic top-up', ''];
-  if (attemptsExhausted) return ['review the pilot allowance', ''];
-  if (awaiting) return [awaiting.proposal.kind === 'coding' ? 'review the coding assignment: ' : 'decide on the proposal: ', awaiting.proposal.title];
-  if (v.continuationAvailable) return ['review the next Eve request', ''];
-  if (open) return ['work on: ', open.title];
-  if (priority) return ['priority: ', priority.text];
-  return ['ask Eve for the next useful step', ''];
+  if (failedStart && !job.releasedAt) return ['review the failed coding start in the web app', '', 'blocked'];
+  if (dollarsExhausted) return ['review the pilot allowance; no automatic top-up', '', 'blocked'];
+  if (attemptsExhausted) return ['review the pilot allowance', '', 'blocked'];
+  if (awaiting) return [awaiting.proposal.kind === 'coding' ? 'review the coding assignment: ' : 'decide on the proposal: ', awaiting.proposal.title, 'awaiting_decision'];
+  if (needsContext) return ['answer Eve\'s question in a new request: ', needsContext.proposal?.question ?? needsContext.proposal?.title ?? '', 'awaiting_decision'];
+  if (notSent) return ['check the allowance and brief size, then ask again', '', 'blocked'];
+  if (v.continuationAvailable) return ['review the next Eve request', '', 'awaiting_decision'];
+  if (open) return ['work on: ', open.title, 'completed', 'Decision recorded'];
+  const finished = done || (job && job.releasedAt && result === 'merged_pr') ? 'completed' : 'ready';
+  if (priority) return ['priority: ', priority.text, finished];
+  return ['ask Eve for the next useful step', '', finished];
+}
+
+/** True when a recorded thinking request is older than the hosted limit allows (display only). */
+export function requestStalled(record, observedAt) {
+  const nowMs = Date.parse(observedAt ?? '');
+  return Boolean(record?.status === 'thinking' && !record.local && Number.isFinite(nowMs) && nowMs - Date.parse(record.createdAt) > STALLED_AFTER_MS);
+}
+
+/** One of OWNER_STATES' keys plus its label, derived from the same branch as the Next text. */
+export function ownerState(view, { now } = {}) {
+  const [, , key, label] = next(facts(view, { now }));
+  return { key, label: label ?? OWNER_STATES[key] };
 }
 
 /**
  * @param {object} view steward view / web state
- * @param {{ link?: string }} [options] optional link appended after the text
+ * @param {{ link?: string, state?: boolean, now?: string }} [options] optional link appended after the text;
+ *   state prefixes the owner state; now overrides the view's server time (view.observedAt)
  * @returns {string} at most 280 characters including the link
  */
-export function statusSummary(view, { link = '' } = {}) {
-  const f = facts(view);
-  const parts = [['Progress: ', ...progress(f)], ['Blocker: ', ...blocker(f)], ['Next: ', ...next(f)]];
+export function statusSummary(view, { link = '', state = false, now } = {}) {
+  const f = facts(view, { now });
+  const [nextFixed, nextDetail, key, label] = next(f);
+  const parts = [...(state ? [['State: ', label ?? OWNER_STATES[key], '']] : []), ['Progress: ', ...progress(f)], ['Blocker: ', ...blocker(f)], ['Next: ', nextFixed, nextDetail]];
   const suffix = typeof link === 'string' && link.trim() ? `\n${link.trim()}` : '';
   const budget = STATUS_SUMMARY_LIMIT - suffix.length;
   const render = limits => parts.map(([label, fixed, detail], i) => `${label}${fixed}${detail ? clip(detail, limits[i]).replace(/\.$/, '') : ''}.`).join(' ');
-  const limits = [80, 80, 80];
+  const limits = parts.map(() => 80);
   let text = render(limits);
   for (let i = 0; text.length > budget && i < parts.length; i++) {
     const excess = text.length - budget;
