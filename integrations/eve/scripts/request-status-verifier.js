@@ -230,6 +230,139 @@ async function scenarioBlocked({ fixture, page, shots }) {
   return assertions;
 }
 
+function assertionKit() {
+  const assertions = [];
+  const fail = (name, observed) => { assertions.push({ name, ok: false, observed }); throw new Error(name + ': ' + observed); };
+  const pass = (name, observed) => assertions.push({ name, ok: true, observed });
+  return { assertions, fail, pass };
+}
+const sameCalls = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+
+async function expectHandoff(page, kind, { fail, pass }) {
+  const handoff = page.locator(`[data-recovery-case="${kind}"]`);
+  try { await handoff.waitFor({ timeout: 20000 }); } catch { fail('missing-recovery-handoff', `Expected a handoff for case ${kind}`); }
+  const text = await handoff.innerText();
+  for (const label of ['What happened', 'Still unknown', 'Who needs to act', 'Next step']) {
+    if (!text.includes(label)) fail('handoff-field-missing', label);
+  }
+  pass(`handoff-${kind}-visible`, text.replace(/\s+/g, ' ').slice(0, 600));
+  return { handoff, text };
+}
+
+async function scenarioRejectedReviewRecovery({ fixture, page, shots }) {
+  const kit = assertionKit(); const { fail, pass } = kit;
+  const { reviewId } = await fixture.prepareHeldReview('refused');
+  await login(page, fixture);
+  await page.getByText('Needs operator review').first().waitFor({ timeout: 20000 });
+  const { text } = await expectHandoff(page, 'confirmed_rejection', kit);
+  if (!/refused/.test(text) || !/You \(the owner\)/.test(text)) fail('handoff-content', text.slice(0, 300));
+  if (!(await page.getByLabel('Request to Eve').isDisabled())) fail('ask-must-be-blocked-while-held', 'enabled');
+  pass('ask-blocked-while-held', true);
+  if (await page.getByRole('button', { name: 'Retry this request once' }).count()) fail('coding-review-must-not-offer-retry', 'retry shown');
+  pass('no-proposal-retry-for-coding-review', true);
+  await shots.held();
+  const ack = page.getByRole('button', { name: 'Acknowledge failed review' });
+  try { await ack.waitFor({ timeout: 10000 }); } catch { fail('missing-acknowledge-control', 'Acknowledge failed review button absent'); }
+  await shots.available(ack);
+  pass('acknowledge-available', true);
+
+  const stateBefore = await fixture.store.read(); const callsBefore = fixture.modelCalls();
+  await ack.click();
+  try { await page.getByText('Failed review acknowledged · history kept').waitFor({ timeout: 20000 }); }
+  catch { fail('acknowledgement-not-shown', 'Expected label "Failed review acknowledged · history kept" after acknowledging'); }
+  const callsAfter = fixture.modelCalls();
+  if (!sameCalls(callsBefore, callsAfter)) fail('acknowledge-sent-model-request', JSON.stringify({ callsBefore, callsAfter }));
+  pass('acknowledge-no-model-or-routine-request', callsAfter);
+  const stateAfter = await fixture.store.read(); const record = stateAfter.requests[reviewId];
+  if (record.status !== 'rejection_acknowledged') fail('acknowledgement-not-persisted', record.status);
+  if (JSON.stringify(record.provider) !== JSON.stringify(stateBefore.requests[reviewId].provider) || stateAfter.reservedMicros !== stateBefore.reservedMicros
+    || JSON.stringify(stateAfter.coding) !== JSON.stringify(stateBefore.coding)) fail('records-or-accounting-changed', 'provider/reservation/task changed');
+  pass('records-and-accounting-retained', { reservedMicros: stateAfter.reservedMicros, retained: record.provider.reservedMicros });
+
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  try { await page.getByText('Failed review acknowledged · history kept').waitFor({ timeout: 20000 }); }
+  catch { fail('acknowledgement-not-persisted', 'label missing after reload'); }
+  if (await page.getByRole('button', { name: 'Acknowledge failed review' }).count()) fail('acknowledge-still-offered', 'after reload');
+  pass('acknowledgement-persisted-after-reload', true);
+  const fresh = page.getByRole('button', { name: 'Start a fresh request' });
+  try { await fresh.waitFor({ timeout: 10000 }); } catch { fail('missing-next-step', 'Start a fresh request button absent'); }
+  await fresh.click();
+  await page.waitForFunction(() => document.activeElement?.id === 'request', null, { timeout: 5000 }).catch(() => fail('next-step-not-reachable', 'request field not focused'));
+  if (await page.getByLabel('Request to Eve').isDisabled()) fail('next-step-not-reachable', 'request field disabled');
+  pass('next-step-fresh-request-reachable', true);
+  await shots.after();
+
+  fixture.judge.hold();
+  await page.getByLabel('Request to Eve').fill('After the failed review, what is the next useful step?');
+  const called = fixture.judge.waitUntilCalled({ timeoutMs: 20000 });
+  await page.getByRole('button', { name: 'Ask Eve' }).click();
+  await called;
+  fixture.judge.release(PROPOSAL_OK);
+  await page.getByRole('heading', { name: 'Confirm the normalization priority' }).waitFor({ timeout: 20000 });
+  await page.getByRole('button', { name: 'Approve commitment' }).waitFor({ timeout: 10000 });
+  const finalState = await fixture.store.read();
+  const freshIds = Object.keys(finalState.requests).filter(id => id !== reviewId);
+  if (freshIds.length !== 1 || finalState.requests[freshIds[0]].status !== 'awaiting_approval') fail('fresh-request-not-created', JSON.stringify(freshIds));
+  const finalCalls = fixture.modelCalls();
+  if (finalCalls.reviewJudge !== callsBefore.reviewJudge || finalCalls.reviewProviderSend !== callsBefore.reviewProviderSend) fail('review-was-retried', JSON.stringify(finalCalls));
+  pass('fresh-request-awaits-fresh-approval', { newRequestId: freshIds[0] !== reviewId, calls: finalCalls });
+  return kit.assertions;
+}
+
+async function scenarioUncertainReviewBlocked({ fixture, page, shots }) {
+  const kit = assertionKit(); const { fail, pass } = kit;
+  const { reviewId } = await fixture.prepareHeldReview('lost');
+  await login(page, fixture);
+  await page.getByText('Needs operator review').first().waitFor({ timeout: 20000 });
+  const { text } = await expectHandoff(page, 'uncertain_delivery', kit);
+  if (!text.includes('Missing evidence or capability') || !/session reconciliation/.test(text) || !/Keep this held/.test(text)) fail('uncertain-handoff-content', text.slice(0, 400));
+  pass('uncertain-handoff-names-missing-capability', true);
+  if (await page.getByRole('button', { name: 'Acknowledge failed review' }).count()) fail('uncertain-must-not-offer-acknowledge', 'shown');
+  if (await page.getByRole('button', { name: 'Retry this request once' }).count()) fail('uncertain-must-not-offer-retry', 'shown');
+  if (!(await page.getByLabel('Request to Eve').isDisabled())) fail('uncertain-must-block-new-requests', 'ask enabled');
+  pass('uncertain-offers-no-recovery-and-blocks-requests', true);
+  await shots.uncertain();
+  const callsBefore = fixture.modelCalls();
+  const direct = await page.evaluate(async id => {
+    const r = await fetch('/api/steward/recovery/acknowledge', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ requestId: id, acknowledgeHash: 'a'.repeat(64) }) });
+    return { status: r.status, body: await r.json() };
+  }, reviewId);
+  if (direct.status !== 409 || direct.body.error !== 'RECOVERY_NOT_SUPPORTED') fail('uncertain-direct-acknowledge-not-rejected', JSON.stringify(direct));
+  const record = (await fixture.store.read()).requests[reviewId];
+  if (record.status !== 'held') fail('uncertain-record-changed', record.status);
+  if (!sameCalls(callsBefore, fixture.modelCalls())) fail('uncertain-sent-model-request', JSON.stringify(fixture.modelCalls()));
+  pass('uncertain-direct-acknowledge-rejected', direct);
+  return kit.assertions;
+}
+
+async function runScenario({ name, evidenceDir, netnsReported, secrets, scenarios, scenarioFailures, cleanupResults, failureShot, body }) {
+  const { cleanup } = await withFixture(evidenceDir, async ({ fixture, browser }) => {
+    secrets.push(fixture.getOwnerLogin().email, fixture.getOwnerLogin().password, fixture._credentials.secret);
+    const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+    const routeFailures = [];
+    await installBrowserRoute(context, fixture, routeFailures);
+    const page = await context.newPage();
+    const sc = { name, startedAt: phxNow(), ok: false, assertions: [], error: null, durationMs: 0 };
+    const t0 = Date.now();
+    try {
+      sc.assertions = await body({ fixture, page });
+      if (routeFailures.length) throw new Error(`network-boundary:${routeFailures.join(';')}`);
+      if (fixture.blockedBrowser.length || fixture.blockedNode.length) throw new Error(`blocked-network:${JSON.stringify([...fixture.blockedBrowser, ...fixture.blockedNode])}`);
+      sc.ok = sc.assertions.every(a => a.ok);
+    } catch (e) {
+      sc.error = String(e.message || e); sc.ok = false;
+      try { await page.screenshot({ path: join(evidenceDir, failureShot), fullPage: true }); } catch { /* ignore */ }
+    } finally {
+      sc.durationMs = Date.now() - t0; sc.finishedAt = phxNow();
+      sc.modelCalls = fixture.modelCalls();
+      scenarios.push(sc);
+      await context.close();
+    }
+    if (!sc.ok) scenarioFailures.push(sc.error || sc.name);
+  });
+  cleanupResults.push({ scenario: name, ...cleanup });
+}
+
 async function runOnce({ evidenceDir, netnsReported }) {
   const started = Date.now();
   const headSha = await gitSha(repoRoot);
@@ -326,6 +459,17 @@ async function runOnce({ evidenceDir, netnsReported }) {
     });
     cleanupResults.push({ scenario: 'blocked-request', ...cleanup });
   }
+
+  // Scenarios 3 and 4 — held coding reviews, each on a fresh fixture
+  const shared = { evidenceDir, netnsReported, secrets, scenarios, scenarioFailures, cleanupResults };
+  await runScenario({ ...shared, name: 'held-rejected-review-recovery', failureShot: '05-failure.png', body: ({ fixture, page }) => scenarioRejectedReviewRecovery({ fixture, page, shots: {
+    held: () => page.screenshot({ path: join(evidenceDir, '05-held-with-handoff.png'), fullPage: true }),
+    available: ack => page.locator('article', { has: ack }).screenshot({ path: join(evidenceDir, '06-recovery-available.png') }),
+    after: () => page.screenshot({ path: join(evidenceDir, '07-after-recovery-next-step.png'), fullPage: true }),
+  } }) });
+  await runScenario({ ...shared, name: 'held-uncertain-review-blocked', failureShot: '08-failure.png', body: ({ fixture, page }) => scenarioUncertainReviewBlocked({ fixture, page, shots: {
+    uncertain: () => page.screenshot({ path: join(evidenceDir, '08-uncertain-still-blocked.png'), fullPage: true }),
+  } }) });
 
   const report = {
     generatedAt: phxNow(),
