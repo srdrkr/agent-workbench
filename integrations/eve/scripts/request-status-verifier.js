@@ -22,6 +22,7 @@ import {
   scrubArtifactText,
   resolveClientAssets,
 } from './request-status-fixture.js';
+import { ASSIGNMENT_SCENARIOS, ASSIGNMENT_FIXTURE_OPTIONS } from './assignment-draft-scenarios.js';
 
 const execFile = promisify(execFileCb);
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -86,14 +87,14 @@ async function ensureSpaBuild() {
   return { built: true, reason: 'ran-nuxt-generate' };
 }
 
-async function withFixture(evidenceDir, fn) {
+async function withFixture(evidenceDir, fn, fixtureOptions = {}) {
   const pgDir = await mkdtemp(join(tmpdir(), 'eve-rsv-pg-'));
   let fixture;
   const cleanup = { pgDirRemoved: false, browserClosed: false, serverClosed: false, leftoverProcesses: [], leftoverPorts: [], errors: [] };
   let browser;
   let result;
   try {
-    fixture = await startRequestStatusFixture({ pgDir });
+    fixture = await startRequestStatusFixture({ pgDir, ...fixtureOptions });
     browser = await chromium.launch({ headless: true });
     result = await fn({ fixture, browser, evidenceDir, pgDir });
   } finally {
@@ -325,6 +326,43 @@ async function runOnce({ evidenceDir, netnsReported }) {
       return sc.name;
     });
     cleanupResults.push({ scenario: 'blocked-request', ...cleanup });
+  }
+
+  // Assignment drafting scenarios — one fresh fixture each, synthetic coding connection.
+  for (const scenario of ASSIGNMENT_SCENARIOS) {
+    const { cleanup } = await withFixture(evidenceDir, async ({ fixture, browser }) => {
+      secrets.push(fixture.getOwnerLogin().email, fixture.getOwnerLogin().password, fixture._credentials.secret);
+      const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+      const routeFailures = [];
+      await installBrowserRoute(context, fixture, routeFailures);
+      const page = await context.newPage();
+      const shot = name => page.screenshot({ path: join(evidenceDir, `${name}.png`), fullPage: true });
+      const sc = { name: scenario.name, startedAt: phxNow(), ok: false, assertions: [], error: null, durationMs: 0 };
+      const t0 = Date.now();
+      try {
+        await login(page, fixture);
+        sc.assertions = await scenario.run({ fixture, page, shot });
+        if (routeFailures.length) throw new Error(`network-boundary:${routeFailures.join(';')}`);
+        if (fixture.blockedBrowser.length) throw new Error(`browser-blocked:${JSON.stringify(fixture.blockedBrowser)}`);
+        sc.ok = sc.assertions.length > 0 && sc.assertions.every(a => a.ok);
+      } catch (e) {
+        sc.error = String(e.message || e);
+        sc.ok = false;
+        try { await shot(scenario.failureShot); } catch { /* ignore */ }
+      } finally {
+        sc.durationMs = Date.now() - t0;
+        sc.finishedAt = phxNow();
+        sc.routineSends = fixture.codingSends.length;
+        const cov = fixture.networkCoverage();
+        cov.netns = Boolean(netnsReported);
+        networkCoverage = { ...cov, blockedRequests: [...(networkCoverage?.blockedRequests || []), ...cov.blockedRequests] };
+        scenarios.push(sc);
+        await context.close();
+      }
+      if (!sc.ok) scenarioFailures.push(sc.error || sc.name);
+      return sc.name;
+    }, ASSIGNMENT_FIXTURE_OPTIONS);
+    cleanupResults.push({ scenario: scenario.name, ...cleanup });
   }
 
   const report = {
