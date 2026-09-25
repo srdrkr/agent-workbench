@@ -49,3 +49,34 @@ Run `node --test test/follow-through.test.js` from the Eve integration directory
 These are deterministic policy/integration evaluations, not measured real-model review quality. For the live trial, the owner should label: was the finding real, was the correction useful, was the escalation necessary, how many manual transfers remained, and did the notification say what was needed? Keep false-positive reviews and unnecessary interruptions as future frozen scenarios. Inspect existing Eve traces first; Phoenix activation remains a separate concrete choice after inspecting a representative trace.
 
 Sources: [Routine branch permissions](https://code.claude.com/docs/en/routines#repositories-and-branch-permissions), [Routine fire contract](https://platform.claude.com/docs/en/api/claude-code/routines-fire), [cloud sessions and Auto-fix](https://code.claude.com/docs/en/claude-code-on-the-web).
+
+## Held review recovery
+
+A failed automatic review whose provider outcome was recorded is held. The held record
+blocks new model work until someone resolves it. The web UI shows a handoff on each held
+record with four parts: what happened, what is still unknown, who needs to act and the
+next step. Steward classifies the record only from evidence it recorded itself. That
+evidence is the transport intent and reservation, the HTTP status and the error category
+parsed from the provider's error body.
+
+| Case | Evidence Steward has | Result |
+|---|---|---|
+| Confirmed refusal | HTTP 400/401/403/404/413/429/503/529 with a matching parsed error category, a complete intent and a reservation | The owner can acknowledge it once the task's follow-through has stopped |
+| Expired authority | A confirmed refusal, but the task grant or the brief is no longer current | Acknowledgement is allowed. It never resumes the grant; new work needs a fresh brief and approval |
+| Allowance exhausted | The provider spend limit (`enforced_spend_limit_reached`, `quota_for_entity_exceeded`) or the local allowance is used up | Acknowledgement is allowed. It never refills the allowance |
+| Uncertain delivery | An intent was recorded but no HTTP response | Stays held. An operator must check provider usage for the session |
+| Unverified output | A 2xx response but no validated result; the raw output is not retained | Stays held. An operator must check provider logs |
+| Unclassified | A status without a recognized error body, or a category that does not confirm a refusal (for example 500) | Stays held |
+
+`POST /api/steward/recovery/acknowledge` with `{ requestId, acknowledgeHash }` is owner-authenticated
+like every other steward route. The hash binds the record, its provider evidence, the case
+and the task status. Any change makes it stale. The acknowledgement sets the record to
+`rejection_acknowledged` and adds one `held_rejection_acknowledged` event. It keeps the
+provider record, the reservation and the task history, and it sends no model or Routine
+request. Repeating it returns the same record. There is no retry, no resumed grant and no
+general "clear held" control. The owner's next step is a fresh request with a new request
+ID, which goes through normal proposal and approval.
+
+Held **proposal** requests keep the existing one-time retry for rate-limit or overload
+refusals. Steward has no owner acknowledgement for them. A held proposal whose brief
+expired stays held, and the operator must resolve it.
