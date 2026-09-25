@@ -35,3 +35,22 @@ Keep the existing fixed connection configuration and token. After reviewing and 
 ## Pilot evidence
 
 Local regression tests cover accounting preservation, stale approvals, memory isolation, assignment scope, single dispatch, monitor crash recovery and notification deduplication. They do not establish general model quality. During the owner pilot, record whether Eve chose a useful next action, which interventions were needed, and whether the resulting change satisfied its acceptance criteria. SMS, more bots and a coordinator follow that learning loop.
+
+## Status summary states
+
+The web summary and Telegram `/status` share one text (`shared/status-summary.js`). It starts with one of five states:
+
+| State | Meaning | Next step shown |
+|---|---|---|
+| In progress | Eve is working on a recorded or just-submitted request, or Claude was observed running | Wait. The request does not need to be sent again. |
+| Your decision needed | A proposal, a clarifying question or a PR is waiting for you | Decide, answer in a new request, or review the PR |
+| Blocked | Something must be resolved first: held attempt, pause, expired brief, used-up allowance, unconfirmed coding start, unsent request, or a stalled request | The specific resolution |
+| Completed / Decision recorded | Your decision is recorded or owner-reported work is done. A commitment is never described as done work. | The next piece of work, or ask Eve |
+| Ready | Nothing has been recorded yet | Ask Eve |
+
+The state comes from the same rule as the "Next:" text, so the two cannot disagree. The web
+app displays a request you just submitted as in progress straight away, before the server
+confirms it. Reloading the page shows the stored state instead. A request whose record is
+older than five minutes without a result is shown as stalled: the hosted function stops
+after 90 seconds, so it ended without recording an outcome. An operator must check it.
+That classification is display only and changes nothing in storage.

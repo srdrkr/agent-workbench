@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { HostedSteward, initialState } from '../hosted/steward.js';
-import { statusSummary, STATUS_SUMMARY_LIMIT } from '../shared/status-summary.js';
+import { statusSummary, ownerState, STATUS_SUMMARY_LIMIT, STALLED_AFTER_MS } from '../shared/status-summary.js';
 
 // Regression coverage uses the application's own persisted state: the initial
 // state, records written by propose/approve/pause/context changes, coding job
@@ -257,4 +257,95 @@ test('exhausted allowance keeps unresolved work ahead of a blocked allowance rev
   w.state.reservedMicros = w.state.budgetMicros;
   codingJob(w.state, { dispatch: 'unknown', execution: 'exited', result: 'tested_draft_pr' });
   assert.equal(parts(await w.summary()).Next, 'close the coding run, then review the draft PR');
+});
+
+// Owner-state coverage. The state is part of the same Next branch, so both surfaces agree.
+const stateOf = text => text.match(/^State: ([^.]+)\./)?.[1];
+const both = (view, options = {}) => { const text = statusSummary(view, { ...options, state: true }); assert.equal(stateOf(text), ownerState(view, options).label); return { text, key: ownerState(view, options).key, p: parts(text.replace(/^State: [^.]+\. /, '')) }; };
+function heldJudge() {
+  let release; const gate = new Promise(resolve => { release = resolve; });
+  let called; const calledSignal = new Promise(resolve => { called = resolve; });
+  return { judge: async () => { called(); await gate; return proposal; }, release, called: calledSignal };
+}
+
+test('a request in progress reads as working everywhere and never asks for it again', async () => {
+  const h = heldJudge(); const w = workspace({ judge: h.judge });
+  const first = ask(); const running = w.steward.propose(first);
+  await h.called;
+  const view = await w.steward.view();
+  assert.equal(view.requests[0].status, 'thinking');
+  let r = both(view);
+  assert.equal(r.key, 'working'); assert.match(r.text, /^State: In progress\./);
+  assert.equal(r.p.Next, "wait for Eve's answer; no need to send the request again");
+  assert.equal(r.p.Blocker, 'none; Eve is working on your request');
+  assert.doesNotMatch(r.text, /ask Eve|ask again|submit/i);
+  // An expired brief or a pause cannot be acted on until the request ends, so working still leads.
+  r = both({ ...view, contextFresh: false }); assert.equal(r.key, 'working'); assert.match(r.p.Next, /no need to send/);
+  r = both({ ...view, paused: true }); assert.equal(r.key, 'working'); assert.equal(r.p.Next, 'wait for Eve before resuming');
+  // Existing duplicate-admission guards are unchanged while it runs.
+  await assert.rejects(w.steward.propose(ask()), /UNRESOLVED_MODEL_ATTEMPT/);
+  await assert.rejects(w.steward.propose({ ...first, message: 'different text' }), /REQUEST_ID_CONFLICT/);
+  h.release(); const done = await running;
+  assert.equal(done.status, 'awaiting_approval');
+  r = both(await w.steward.view());
+  assert.equal(r.key, 'awaiting_decision'); assert.match(r.text, /^State: Your decision needed\./);
+  assert.equal(r.p.Next, 'decide on the proposal: Review the blocker');
+  assert.doesNotMatch(r.text, /done|executed|completed|committed/i);
+  await w.steward.approve({ requestId: done.id, proposalHash: done.proposalHash });
+  r = both(await w.steward.view());
+  assert.equal(r.key, 'completed'); assert.match(r.text, /^State: Decision recorded\. Progress: committed, not yet done: Review the blocker/);
+  assert.equal(r.p.Next, 'work on: Review the blocker');
+  await w.steward.completeCommitment({ commitmentId: done.id, expectedContextRevision: w.state.project.revision });
+  r = both(await w.steward.view());
+  assert.equal(r.key, 'completed'); assert.match(r.text, /^State: Completed\. Progress: owner reported done: Review the blocker/);
+  assert.equal(r.p.Next, 'ask Eve for the next useful step');
+});
+
+test('a recorded request older than the hosted limit is stalled and blocked, never working', async () => {
+  const h = heldJudge(); const w = workspace({ judge: h.judge });
+  const running = w.steward.propose(ask()); await h.called;
+  const view = await w.steward.view();
+  const createdAt = Date.parse(view.requests[0].createdAt);
+  let r = both(view, { now: new Date(createdAt + STALLED_AFTER_MS - 1000).toISOString() });
+  assert.equal(r.key, 'working');
+  r = both(view, { now: new Date(createdAt + STALLED_AFTER_MS + 1000).toISOString() });
+  assert.equal(r.key, 'blocked'); assert.equal(r.p.Blocker, 'no result recorded from Eve; outcome unknown');
+  assert.equal(r.p.Next, 'ask the operator to check the stalled request; do not resend it');
+  // The view's own server time gives the same answer; a local, not yet recorded submission is never stalled.
+  assert.equal(both({ ...view, observedAt: new Date(createdAt + STALLED_AFTER_MS + 1000).toISOString() }).key, 'blocked');
+  const local = { ...view, observedAt: new Date(createdAt + 3600000).toISOString(), requests: [{ ...view.requests[0], local: true }] };
+  assert.equal(both(local).key, 'working');
+  h.release(); await running;
+});
+
+test('terminal request outcomes each point to their next action', async () => {
+  const clarify = workspace({ judge: async () => ({ kind: 'clarify', candidateId: null, title: 'Which pages matter first?', rationale: 'The brief lists two areas.', citations: ['brief'], question: 'Should help-centre links or blog links come first?' }) });
+  assert.equal((await clarify.steward.propose(ask())).status, 'needs_context');
+  let r = both(await clarify.steward.view());
+  assert.equal(r.key, 'awaiting_decision');
+  assert.equal(r.p.Next, "answer Eve's question in a new request: Should help-centre links or blog links come first?");
+
+  // not_sent means the provider was never admitted (no intent recorded); the view below is that recorded shape.
+  const unsent = { project: { id: 'p', revision: 'r' }, contextFresh: true, providerAttempts: 0, maxProviderAttempts: 5, budgetMicros: 10, reservedMicros: 0,
+    requests: [{ id: 'n', status: 'not_sent', contextRevision: 'r', createdAt: '2026-09-21T10:00:00.000Z' }], progress: { notes: [], priority: null, commitments: [], jobs: [] } };
+  r = both(unsent); assert.equal(r.key, 'blocked'); assert.equal(r.p.Blocker, 'the last request was not sent'); assert.equal(r.p.Next, 'check the allowance and brief size, then ask again');
+
+  const held = workspace({ judge: async () => { throw new Error('synthetic gateway failure'); } });
+  assert.equal((await held.steward.propose(ask())).status, 'held');
+  r = both(await held.steward.view()); assert.equal(r.key, 'blocked'); assert.equal(r.p.Next, 'review the held attempt');
+});
+
+test('the four owner states are distinct and stay within 280 characters with the link', async () => {
+  const labels = new Set();
+  const h = heldJudge(); const w = workspace({ judge: h.judge });
+  const running = w.steward.propose(ask()); await h.called;
+  const views = [await w.steward.view()];
+  h.release(); const done = await running; views.push(await w.steward.view());
+  const held = workspace({ judge: async () => { throw new Error('synthetic'); } }); await held.steward.propose(ask()); views.push(await held.steward.view());
+  await w.steward.approve({ requestId: done.id, proposalHash: done.proposalHash });
+  await w.steward.completeCommitment({ commitmentId: done.id, expectedContextRevision: w.state.project.revision }); views.push(await w.steward.view());
+  const keys = views.map(v => ownerState(v).key);
+  assert.deepEqual(keys, ['working', 'awaiting_decision', 'blocked', 'completed']);
+  for (const v of views) { const text = statusSummary(v, { state: true, link: `${LINK}/${'p'.repeat(120)}` }); labels.add(stateOf(text)); assert.ok(text.length <= STATUS_SUMMARY_LIMIT); }
+  assert.equal(labels.size, 4);
 });
