@@ -4,7 +4,7 @@ import { mkdtemp, rm, readFile, writeFile, chmod } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawn, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { buildNetnsWrapperScript } from '../scripts/request-status-verifier.js';
@@ -29,9 +29,31 @@ async function runVerifier(args, env) {
     });
     return { code: 0, stdout };
   } catch (e) {
-    return { code: typeof e.code === 'number' ? e.code : 1, stdout: e.stdout || '' };
+    return { code: typeof e.code === 'number' ? e.code : 1, stdout: e.stdout || '', stderr: e.stderr || '' };
   }
 }
+
+test('a build failure removes a stale success report before any browser scenario runs', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'eve-verifier-build-fail-'));
+  try {
+    await writeFile(join(dir, 'report.json'), JSON.stringify({ ok: true, stale: true }));
+    const preload = join(dir, 'fail-build.mjs');
+    await writeFile(preload, `
+      import childProcess from 'node:child_process';
+      import { syncBuiltinESMExports } from 'node:module';
+      const original = childProcess.spawn;
+      childProcess.spawn = function(command, args, options) {
+        if (args?.some(a => a.endsWith('/nuxt/bin/nuxt.mjs'))) throw new Error('SYNTHETIC_NUXT_BUILD_FAILURE');
+        return original(command, args, options);
+      };
+      syncBuiltinESMExports();
+    `);
+    const result = await runVerifier(['--evidence', dir], { NODE_OPTIONS: `--import=${pathToFileURL(preload).href}` });
+    assert.notEqual(result.code, 0);
+    assert.match(result.stderr, /SYNTHETIC_NUXT_BUILD_FAILURE/, 'the injected build failure was reached');
+    await assert.rejects(readFile(join(dir, 'report.json')), { code: 'ENOENT' });
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
 
 test('a leak found during scrub yields persisted report.json ok:false and a non-zero exit (plain path)', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'eve-verifier-leak-'));

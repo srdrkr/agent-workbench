@@ -5,8 +5,12 @@
  * and routes /api/* to the REAL hostedHandler (ownerAuth + HostedSteward + HostedStore
  * on PGlite TestPool). Only the judge/provider boundary is stubbed.
  *
+ * Held-review scenarios seed one synthetic, already-closed coding task and then run
+ * the real FollowThrough -> createCodeReview -> hostedTransport path once, with a
+ * fake provider send (see test/held-review-fixture.js).
+ *
  * Exclusions (explicit): production Nitro/Vercel function assembly, live AI Gateway,
- * live Postgres, Telegram, coding dispatch, follow-through.
+ * live Postgres, Telegram, coding dispatch, live GitHub reads.
  */
 import { createServer } from 'node:http';
 import { randomBytes } from 'node:crypto';
@@ -25,6 +29,7 @@ import { HOSTED_MODEL } from '../hosted/transport.js';
 import { ownerAuth } from '../hosted/auth.js';
 import { hostedHandler } from '../hosted/http.js';
 import { setupHosted } from '../hosted/setup.js';
+import { seedSyntheticTask, runSyntheticReview } from '../test/held-review-fixture.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const eveRoot = resolve(here, '..');
@@ -359,6 +364,7 @@ export async function startRequestStatusFixture({
   const auth = ownerAuth(pool, { origin, secret });
   handler = hostedHandler({ auth, steward, ownerEmail, origin });
 
+  const reviewCounters = { judge: 0, send: 0 };
   const credentials = { email: ownerEmail, password, secret };
   // credentials stay in-process only; callers must not write them into shared artifacts
 
@@ -374,6 +380,17 @@ export async function startRequestStatusFixture({
     /** @deprecated do not log — in-process only */
     _credentials: credentials,
     getOwnerLogin() { return { email: ownerEmail, password }; },
+    /** Approves a pilot, seeds one synthetic closed task and runs one real review with a fake provider outcome. */
+    async prepareHeldReview(outcome) {
+      const now = () => new Date().toISOString();
+      const review = await steward.reviewPilot({ budgetMicros, maxProviderAttempts: 50 });
+      await steward.approvePilot({ reviewHash: review.reviewHash });
+      await seedSyntheticTask(store, now);
+      const { reviewId } = await runSyntheticReview({ store, now, outcome, counters: reviewCounters });
+      return { reviewId };
+    },
+    /** Every model/provider path the fixture can reach, for no-call assertions. */
+    modelCalls() { return { proposeJudge: judgeControl.calls, reviewJudge: reviewCounters.judge, reviewProviderSend: reviewCounters.send }; },
     blockedNode,
     blockedBrowser,
     networkCoverage() {
@@ -390,7 +407,8 @@ export async function startRequestStatusFixture({
           'live AI Gateway / Anthropic transport',
           'live Postgres',
           'Telegram',
-          'coding dispatch / follow-through',
+          'coding dispatch (held-review task is synthetic seed)',
+          'live GitHub reads (synthetic reader)',
         ],
       };
     },

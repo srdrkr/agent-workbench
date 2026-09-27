@@ -4,23 +4,14 @@ import { createHash } from 'node:crypto';
 import { attemptLimit, continuationPacket, reviewContinuation, approveContinuation, judgmentProject } from './continuation.js';
 import { previewContext, applyContext } from './context.js';
 import { validateProject, validateProposal } from '../../../src/steward-policy.js';
+import { heldRecovery, acknowledgeRejectedReview, rejectionReviewHash } from './recovery.js';
+export { rejectionReviewHash } from './recovery.js';
 
 export const digest = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 export const fresh = (project, now) => project.sources.every(s => Date.parse(s.observedAt) <= Date.parse(now) && Date.parse(s.expiresAt) > Date.parse(now));
 const validId = value => typeof value === 'string' && /^[a-z0-9][a-z0-9-]{0,63}$/.test(value);
 const requireValue = (condition, message) => { if (!condition) throw new Error(message); };
 const event = (state, kind, data, at) => state.events.push({ seq: state.events.length + 1, kind, data, at });
-
-export function rejectionReviewHash(record) {
-  const p = record?.provider;
-  if (record?.status !== 'held' || !Number.isFinite(Date.parse(record.completedAt)) || record.retryRequestId
-    || !p?.intentAt || !p.sessionId || !(p.reservedMicros > 0)
-    || ![429, 503].includes(p.httpStatus) || p.rejection?.httpStatus !== p.httpStatus
-    || !['rate_limit_exceeded', 'rate_limit_error', 'overloaded_error', 'api_error'].includes(p.rejection.errorCategory)
-    || p.rejection.providerErrorCode === 'enforced_spend_limit_reached') return null;
-  return digest({ id: record.id, inputHash: record.inputHash, contextRevision: record.contextRevision,
-    judge: record.judge, completedAt: record.completedAt, provider: p });
-}
 
 export function initialState(project, { model, budgetMicros }) {
   validateProject(project);
@@ -43,16 +34,17 @@ export class HostedSteward {
   }); }
   reviewContinuation() { return reviewContinuation(this.store, this.now()); }
   approveContinuation(input) { return approveContinuation(this.store, input, this.now()); }
+  acknowledgeRejectedReview(input) { return acknowledgeRejectedReview(this.store, input, this.now()); }
   previewContext(project) { return previewContext(this.store, project, this.now()); }
   applyContext(input) { return applyContext(this.store, input, this.now()); }
   async view() {
-    const state = await this.store.read();
+    const state = await this.store.read(); const now = this.now();
     let continuationAvailable = false;
     try { continuationPacket(state, this.now()); continuationAvailable = true; } catch { /* Fail closed until the run is verified and closed. */ }
     let continuationProblem = null;
     try { judgmentProject(state, this.now()); } catch (error) { continuationProblem = error.message; }
     return { followThrough: followThroughView(state), pilot: state.pilot ?? null, progress: progressView(state), monitor: state.monitor ? { lastCheckedAt: state.monitor.lastCheckedAt, lastError: state.monitor.lastError, notificationStatus: state.monitor.notificationStatus } : null, repeatableCoding: Boolean(this.coding?.config?.repeatable), continuationAvailable, continuationProblem, project: state.project, contextFresh: fresh(state.project, this.now()), judge: state.model,
-      requests: Object.values(state.requests).sort((a, b) => (b.createdAt ?? '').localeCompare(a.createdAt ?? '') || (b.id ?? '').localeCompare(a.id ?? '')).slice(0, 50).map(r => ({ ...r, retryReviewHash: rejectionReviewHash(r) })), commitments: Object.values(state.commitments).filter(c => c.contextRevision === state.project.revision),
+      requests: Object.values(state.requests).sort((a, b) => (b.createdAt ?? '').localeCompare(a.createdAt ?? '') || (b.id ?? '').localeCompare(a.id ?? '')).slice(0, 50).map(r => ({ ...r, retryReviewHash: rejectionReviewHash(r), recovery: heldRecovery(state, r, now) })), commitments: Object.values(state.commitments).filter(c => c.contextRevision === state.project.revision),
       historicalCommitments: Object.values(state.commitments).filter(c => c.contextRevision !== state.project.revision),
       providerAttempts: Object.values(state.requests).filter(r => r.provider).length, maxProviderAttempts: attemptLimit(state),
       budgetMicros: state.budgetMicros, reservedMicros: state.reservedMicros, paused: state.paused,
