@@ -112,28 +112,35 @@ async function withFixture(evidenceDir, fn) {
 }
 
 /**
- * The single final write of report.json: scrubs `report` against `secrets`,
- * writes the scrubbed text, then greps the evidence directory for any
- * remaining occurrence of a secret. Callers must not write report.json
- * again after this returns, or the leak check stops covering what's
- * actually left on disk.
+ * The single final write of report.json. Runs the leak check against a
+ * scrubbed candidate BEFORE writing anything, so the persisted file always
+ * reflects the leak result (ok:false + scrubFailure when a leak is found),
+ * never an earlier "ok:true" snapshot taken before the check ran. Callers
+ * must not write report.json again after this returns, or the leak check
+ * stops covering what's actually left on disk.
  */
 export async function scrubAndWriteReport(evidenceDir, report, secrets) {
-  const raw = JSON.stringify(report, null, 2);
-  const scrubbed = scrubArtifactText(raw, secrets);
-  await writeFile(join(evidenceDir, 'report.json'), scrubbed);
+  const candidateText = scrubArtifactText(JSON.stringify(report, null, 2), secrets);
   const leakCheck = { checkedAt: phxNow(), leaks: [] };
   for (const secret of secrets) {
     if (!secret) continue;
+    const files = [];
+    // Belt-and-suspenders: catch a secret that survives scrubArtifactText in
+    // the report's own text, in addition to greping the rest of the
+    // evidence directory for stray unscrubbed artifacts (e.g. a leftover
+    // log). Neither check writes anything yet.
+    if (candidateText.includes(secret)) files.push('report.json');
     const { stdout } = await execFile('bash', ['-lc', `grep -R --fixed-strings -l -- ${JSON.stringify(secret)} ${JSON.stringify(evidenceDir)} 2>/dev/null || true`]);
-    if (stdout.trim()) leakCheck.leaks.push({ hint: secret.slice(0, 4) + '…', files: stdout.trim().split('\n') });
+    if (stdout.trim()) files.push(...stdout.trim().split('\n'));
+    if (files.length) leakCheck.leaks.push({ hint: secret.slice(0, 4) + '…', files });
   }
+  const finalReport = leakCheck.leaks.length
+    ? { ...report, ok: false, scrubFailure: leakCheck }
+    : report;
+  const finalText = scrubArtifactText(JSON.stringify(finalReport, null, 2), secrets);
+  await writeFile(join(evidenceDir, 'report.json'), finalText);
   await writeFile(join(evidenceDir, 'scrub-check.json'), JSON.stringify(leakCheck, null, 2));
-  if (leakCheck.leaks.length) {
-    report.ok = false;
-    report.scrubFailure = leakCheck;
-  }
-  return report;
+  return finalReport;
 }
 
 async function installBrowserRoute(context, fixture, scenarioFailures) {
@@ -253,6 +260,19 @@ async function scenarioBlocked({ fixture, page, shots }) {
   if (approve > 0) fail('held-must-not-offer-approve', `approve buttons=${approve}`);
   pass('held-no-approve-commitment', 'absent');
   return assertions;
+}
+
+/**
+ * Builds the bash script run inside `unshare -rn` for --netns. Exported so
+ * the exit-code-forwarding property below can be tested with plain `bash`,
+ * without needing a real network namespace: the loud loopback failure exits
+ * immediately (unaffected by the rest of the script), and otherwise the
+ * script's own exit code must equal innerCommand's, not `echo`'s (which is
+ * always 0) — that mismatch was the bug that let a failing child mask
+ * itself as success.
+ */
+export function buildNetnsWrapperScript(innerCommand) {
+  return `if ! ip link set lo up 2>/dev/null; then echo '--netns: could not bring up loopback (ip missing or failed)' >&2; exit 1; fi; ${innerCommand}; ec=$?; echo "EXIT:$ec"; exit $ec`;
 }
 
 async function runOnce({ evidenceDir, netnsReported, netnsAvailable }) {
@@ -377,6 +397,27 @@ async function runOnce({ evidenceDir, netnsReported, netnsAvailable }) {
   return scrubAndWriteReport(evidenceDir, report, secrets);
 }
 
+/**
+ * Test-only seam: when EVE_RSV_TEST_STUB=leak is set, main() skips the real
+ * browser run entirely and instead plants a stray unscrubbed secret in the
+ * evidence dir before calling the real scrubAndWriteReport with an
+ * otherwise-ok report — driving the full CLI (persisted report.json +
+ * process exit code, on both the plain and --netns paths) through the exact
+ * "fresh report, leak found late" case without needing a browser. Not
+ * referenced anywhere in normal operation.
+ */
+async function runOnceStubLeak({ evidenceDir }) {
+  const secret = process.env.EVE_RSV_TEST_STUB_SECRET || 'EVE_RSV_TEST_STUB_SECRET_VALUE';
+  await writeFile(join(evidenceDir, 'stray-leftover.log'), `debug dump: ${secret}\n`);
+  const report = { generatedAt: phxNow(), ok: true, stub: 'leak' };
+  return scrubAndWriteReport(evidenceDir, report, [secret]);
+}
+
+async function runOnceForMode(opts) {
+  if (process.env.EVE_RSV_TEST_STUB === 'leak') return runOnceStubLeak(opts);
+  return runOnce(opts);
+}
+
 async function main() {
   const args = parseArgs(process.argv);
   if (args.help) {
@@ -402,7 +443,8 @@ async function main() {
     // child (e.g. missing `ip`) can't have its failure masked by a stale file.
     await rm(reportPath, { force: true });
     const result = await new Promise((resolvePromise) => {
-      const bashScript = `if ! ip link set lo up 2>/dev/null; then echo '--netns: could not bring up loopback (ip missing or failed)' >&2; exit 1; fi; EVE_RSV_IN_NETNS=1 HOME=${JSON.stringify(process.env.HOME)} PATH=${JSON.stringify(process.env.PATH)} CI=true ${JSON.stringify(process.execPath)} ${childArgs.map(a => JSON.stringify(a)).join(' ')}; echo EXIT:$?`;
+      const innerCommand = `EVE_RSV_IN_NETNS=1 HOME=${JSON.stringify(process.env.HOME)} PATH=${JSON.stringify(process.env.PATH)} CI=true ${JSON.stringify(process.execPath)} ${childArgs.map(a => JSON.stringify(a)).join(' ')}`;
+      const bashScript = buildNetnsWrapperScript(innerCommand);
       const child = spawn('unshare', ['-rn', 'bash', '-lc', bashScript], {
         stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, EVE_RSV_IN_NETNS: '1' },
       });
@@ -434,8 +476,8 @@ async function main() {
     netnsAvailable = true;
   } catch { netnsAvailable = false; }
 
-  const report = await runOnce({ evidenceDir, netnsReported: process.env.EVE_RSV_IN_NETNS === '1', netnsAvailable });
-  console.log(JSON.stringify({ ok: report.ok, evidenceDir, scenarios: report.scenarios.map(s => ({ name: s.name, ok: s.ok, error: s.error })) }, null, 2));
+  const report = await runOnceForMode({ evidenceDir, netnsReported: process.env.EVE_RSV_IN_NETNS === '1', netnsAvailable });
+  console.log(JSON.stringify({ ok: report.ok, evidenceDir, scenarios: (report.scenarios || []).map(s => ({ name: s.name, ok: s.ok, error: s.error })) }, null, 2));
   process.exit(report.ok ? 0 : 1);
 }
 

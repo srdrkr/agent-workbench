@@ -99,6 +99,9 @@ test('scrubAndWriteReport detects a leak still present in the evidence dir at ch
     assert.equal(result.ok, false, 'a detected leak must flip ok to false');
     assert.ok(result.scrubFailure && result.scrubFailure.leaks.length >= 1);
 
+    const onDisk = JSON.parse(await readFile(join(dir, 'report.json'), 'utf8'));
+    assert.equal(onDisk.ok, false, 'the persisted report.json must reflect the leak, not an earlier ok:true write');
+
     const scrubCheck = JSON.parse(await readFile(join(dir, 'scrub-check.json'), 'utf8'));
     assert.ok(scrubCheck.leaks.some(l => l.files.some(f => f.includes('stray-leftover.log'))));
   } finally {
