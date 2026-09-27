@@ -10,6 +10,7 @@ import { ownerAuth } from '../hosted/auth.js';
 import { hostedHandler } from '../hosted/http.js';
 import { setupHosted } from '../hosted/setup.js';
 import { seedSyntheticTask, runSyntheticReview } from './held-review-fixture.js';
+import { heldRecovery } from '../hosted/recovery.js';
 
 const project = JSON.parse(await readFile(new URL('../../../fixtures/steward-project.json', import.meta.url)));
 const ownerEmail = 'owner@example.com'; const origin = 'http://localhost:4399';
@@ -104,7 +105,7 @@ test('acknowledgement waits until follow-through has stopped the task', async t 
   const f = await fixture(t);
   const { reviewId } = await held(f, 'refused');
   // Synthetic crash window: the review was recorded but follow-through had not stopped the task yet.
-  await f.store.change(s => { const x = s.coding.jobs['synthetic-task'].followThrough; x.status = 'reviewing'; x.reason = null; x.nextCheckAt = null; });
+  await f.store.change(s => { const x = s.coding.jobs['synthetic-task'].followThrough; x.status = 'reviewing'; x.reason = null; x.nextCheckAt = null; x.reviews[0].status = 'intent'; });
   const waiting = (await f.steward.view()).requests.find(x => x.id === reviewId).recovery;
   assert.equal(waiting.action, 'none'); assert.equal(waiting.acknowledgeHash, null); assert.match(waiting.missing, /not stopped/);
   await assert.rejects(f.steward.acknowledgeRejectedReview({ requestId: reviewId, acknowledgeHash: 'e'.repeat(64) }), /RECOVERY_TASK_ACTIVE/);
@@ -194,6 +195,116 @@ test('a refused proposal keeps the existing one-time retry and has no acknowledg
   assert.match(record.retryReviewHash, /^[a-f0-9]{64}$/);
   assert.equal(record.recovery.case, 'confirmed_rejection'); assert.equal(record.recovery.action, 'none'); assert.match(record.recovery.nextStep, /Retry this request once/);
   await assert.rejects(steward.acknowledgeRejectedReview({ requestId: record.id, acknowledgeHash: 'c'.repeat(64) }), /RECOVERY_NOT_SUPPORTED/);
+  // A consumed retry and a non-retryable refusal must not direct the owner to a missing button.
+  await store.change(s => { s.requests[record.id].retryRequestId = 'already-retried'; });
+  let shown = (await steward.view()).requests[0];
+  assert.equal(shown.retryReviewHash, null); assert.equal(shown.recovery.whoActs, 'Operator');
+  assert.doesNotMatch(shown.recovery.nextStep, /Retry this request once/);
+  await store.change(s => {
+    const r = s.requests[record.id]; delete r.retryRequestId;
+    r.provider.httpStatus = r.provider.rejection.httpStatus = 400;
+    r.provider.rejection.errorCategory = 'invalid_request_error';
+  });
+  shown = (await steward.view()).requests[0];
+  assert.equal(shown.retryReviewHash, null); assert.equal(shown.recovery.whoActs, 'Operator');
+  assert.match(shown.recovery.missing, /no supported recovery/);
+  assert.doesNotMatch(shown.recovery.nextStep, /Retry this request once/);
+  // The existing explicit proposal retry policy remains separate from coding acknowledgement.
+  await store.change(s => {
+    const p = s.requests[record.id].provider;
+    p.httpStatus = p.rejection.httpStatus = 503; p.rejection.errorCategory = 'api_error';
+  });
+  shown = (await steward.view()).requests[0];
+  assert.ok(shown.retryReviewHash); assert.equal(shown.recovery.case, 'unclassified');
+  assert.match(shown.recovery.nextStep, /Retry this request once/);
+  assert.match(shown.recovery.unknown, /Whether any work was done/);
+});
+
+test('refusal classification binds the status to its category, including provider limits', async t => {
+  const f = await fixture(t); const { reviewId } = await held(f, 'refused');
+  const state = await f.store.read(); const record = state.requests[reviewId];
+  const pairs = [[400, 'invalid_request_error'], [401, 'authentication_error'], [402, 'quota_for_entity_exceeded'],
+    [403, 'permission_error'], [403, 'forbidden'], [404, 'not_found'], [404, 'not_found_error'],
+    [404, 'model_not_found'], [413, 'request_too_large'], [429, 'rate_limit_exceeded'], [429, 'rate_limit_error'],
+    [503, 'overloaded_error'], [529, 'overloaded_error']];
+  for (const [status, category] of pairs) {
+    record.provider.httpStatus = record.provider.rejection.httpStatus = status;
+    record.provider.rejection.errorCategory = category;
+    const r = heldRecovery(state, record, f.now());
+    assert.equal(r.action, 'acknowledge', `${status}/${category}`);
+    assert.equal(r.case, status === 402 ? 'allowance_exhausted' : 'confirmed_rejection');
+  }
+  for (const [status, category, code] of [[500, 'internal_server_error', 'enforced_spend_limit_reached'],
+    [502, 'quota_for_entity_exceeded', null], [400, 'quota_for_entity_exceeded', null], [503, 'api_error', null]]) {
+    record.provider.httpStatus = record.provider.rejection.httpStatus = status;
+    Object.assign(record.provider.rejection, { errorCategory: category, providerErrorCode: code });
+    const r = heldRecovery(state, record, f.now());
+    assert.equal(r.case, 'unclassified', `${status}/${category}/${code}`); assert.equal(r.action, 'none');
+  }
+  for (const [status, category] of [[400, 'invalid_request_error'], [429, 'rate_limit_error']]) {
+    record.provider.httpStatus = record.provider.rejection.httpStatus = status;
+    Object.assign(record.provider.rejection, { errorCategory: category, providerErrorCode: 'enforced_spend_limit_reached' });
+    assert.equal(heldRecovery(state, record, f.now()).case, 'allowance_exhausted');
+  }
+});
+
+test('acknowledgement is bound to the current project, task and review entry', async t => {
+  const f = await fixture(t); const { reviewId, record } = await held(f, 'refused');
+  const state = await f.store.read();
+  for (const damage of [
+    s => { s.requests[reviewId].projectId = 'another-project'; },
+    s => { s.coding.jobs['synthetic-task'].projectId = 'another-project'; },
+    s => { s.coding.jobs['synthetic-task'].followThrough.reviews = []; },
+    s => { s.coding.jobs['synthetic-task'].followThrough.reviews[0].headSha = 'b'.repeat(40); },
+    s => { s.coding.jobs['synthetic-task'].followThrough.reviews[0].status = 'completed'; },
+  ]) {
+    const changed = structuredClone(state); damage(changed);
+    const r = heldRecovery(changed, changed.requests[reviewId], f.now());
+    assert.equal(r.action, 'none'); assert.equal(r.whoActs, 'Operator');
+  }
+  await f.store.change(s => { s.coding.jobs['synthetic-task'].followThrough.reviews[0].status = 'intent'; });
+  await assert.rejects(f.steward.acknowledgeRejectedReview({ requestId: reviewId, acknowledgeHash: record.recovery.acknowledgeHash }), /RECOVERY_REVIEW_STALE/);
+  const current = (await f.steward.view()).requests.find(r => r.id === reviewId).recovery;
+  assert.equal(current.action, 'acknowledge', 'a stopped task can have interrupted review finalization');
+  assert.notEqual(current.acknowledgeHash, record.recovery.acknowledgeHash);
+});
+
+test('duplicate acknowledgement while paused keeps all admission and continuation limits', async t => {
+  const f = await fixture(t, { attempts: 5 }); const { reviewId } = await held(f, 'refused');
+  await f.store.change(s => { s.coding.jobs['synthetic-task'].followThrough.status = 'finished'; });
+  await f.steward.pause();
+  const r = (await f.steward.view()).requests.find(x => x.id === reviewId).recovery;
+  const calls = sent(f); const before = await f.store.read();
+  const other = new HostedSteward(new HostedStore(f.pool, { ownerId: ownerEmail, projectId: project.id }), async () => assert.fail('no model call'), { now: f.now });
+  const input = { requestId: reviewId, acknowledgeHash: r.acknowledgeHash };
+  const [first, second] = await Promise.all([f.steward.acknowledgeRejectedReview(input), other.acknowledgeRejectedReview(input)]);
+  assert.deepEqual(first, second);
+  const after = await f.store.read();
+  assert.equal(after.events.filter(e => e.kind === 'held_rejection_acknowledged').length, 1);
+  assert.equal(after.paused, true); assert.equal(after.coding.paused, true);
+  assert.deepEqual(after.coding, before.coding); assert.equal(after.reservedMicros, before.reservedMicros);
+  assert.equal(after.maxProviderAttempts, 5); assert.equal(after.continuation, undefined);
+  await assert.rejects(f.steward.propose(ask('paused-fresh-request')), /ADMISSION_PAUSED/);
+  await assert.rejects(f.steward.reviewContinuation(), /CONTINUATION_UNAVAILABLE/);
+  await assert.rejects(f.steward.acknowledgeRejectedReview({ ...input, acknowledgeHash: 'f'.repeat(64) }), /RECOVERY_REVIEW_STALE/);
+  await f.steward.resume();
+  await f.store.change(s => {
+    for (let i = 0; i < 4; i++) {
+      const id = `previous-proposal-${i}`;
+      s.requests[id] = { id, status: 'approved', provider: { httpStatus: 200, reservedMicros: 1 } };
+      s.reservedMicros += 1;
+    }
+  });
+  await assert.rejects(f.steward.reviewContinuation(), /CONTINUATION_UNAVAILABLE/, 'acknowledgement cannot substitute for a stable GitHub result');
+  await f.store.change(s => { s.coding.jobs['synthetic-task'].result.stable = true; });
+  const continuation = await f.steward.reviewContinuation();
+  assert.equal(continuation.nextLimit, 6); assert.deepEqual(continuation.resolvedRequestIds, []);
+  assert.equal((await f.store.read()).maxProviderAttempts, 5, 'reviewing still does not raise the limit');
+  await f.steward.approveContinuation({ reviewHash: continuation.reviewHash });
+  const continued = await f.store.read();
+  assert.equal(continued.maxProviderAttempts, 6);
+  assert.deepEqual(continued.requests[reviewId], first, 'separate continuation approval keeps the acknowledged review intact');
+  assert.equal(sent(f), calls);
 });
 
 test('the acknowledge route is owner-authenticated, origin-checked and idempotent over HTTP', async t => {

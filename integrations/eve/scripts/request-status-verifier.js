@@ -363,7 +363,7 @@ async function scenarioUncertainReviewBlocked({ fixture, page, shots }) {
   return kit.assertions;
 }
 
-async function runScenario({ name, evidenceDir, netnsReported, secrets, scenarios, scenarioFailures, cleanupResults, failureShot, body }) {
+async function runScenario({ name, evidenceDir, secrets, scenarios, scenarioFailures, cleanupResults, failureShot, body }) {
   const { cleanup } = await withFixture(evidenceDir, async ({ fixture, browser }) => {
     secrets.push(fixture.getOwnerLogin().email, fixture.getOwnerLogin().password, fixture._credentials.secret);
     const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
@@ -502,7 +502,7 @@ async function runOnce({ evidenceDir, netnsReported, netnsAvailable }) {
   }
 
   // Scenarios 3 and 4 — held coding reviews, each on a fresh fixture
-  const shared = { evidenceDir, netnsReported, secrets, scenarios, scenarioFailures, cleanupResults };
+  const shared = { evidenceDir, secrets, scenarios, scenarioFailures, cleanupResults };
   await runScenario({ ...shared, name: 'held-rejected-review-recovery', failureShot: '05-failure.png', body: ({ fixture, page }) => scenarioRejectedReviewRecovery({ fixture, page, shots: {
     held: () => page.screenshot({ path: join(evidenceDir, '05-held-with-handoff.png'), fullPage: true }),
     available: ack => page.locator('article', { has: ack }).screenshot({ path: join(evidenceDir, '06-recovery-available.png') }),

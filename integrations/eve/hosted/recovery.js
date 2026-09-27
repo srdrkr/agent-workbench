@@ -9,11 +9,24 @@ const need = (ok, code) => { if (!ok) throw new Error(code); };
 const terminal = new Set(['blocked', 'finished']);
 const own = (object, key) => Object.hasOwn(object ?? {}, key) ? object[key] : undefined;
 // Documented pre-execution refusals: the status and parsed body category must agree.
-const refusals = { 400: ['invalid_request_error'], 401: ['authentication_error'], 403: ['permission_error', 'forbidden'],
+const refusals = { 400: ['invalid_request_error'], 401: ['authentication_error'], 402: ['quota_for_entity_exceeded'], 403: ['permission_error', 'forbidden'],
   404: ['not_found', 'not_found_error', 'model_not_found'], 413: ['request_too_large'],
-  429: ['rate_limit_exceeded', 'rate_limit_error'], 503: ['overloaded_error', 'api_error'], 529: ['overloaded_error'] };
+  429: ['rate_limit_exceeded', 'rate_limit_error'], 503: ['overloaded_error'], 529: ['overloaded_error'] };
 const dollars = micros => `$${(micros / 1e6).toFixed(6).replace(/0+$/, '').replace(/\.$/, '')}`;
 const fresh = (project, now) => project.sources.every(s => Date.parse(s.observedAt) <= Date.parse(now) && Date.parse(s.expiresAt) > Date.parse(now));
+
+// Existing explicit proposal-retry policy. Sharing this predicate keeps the
+// recovery handoff aligned with the actual button and server admission check.
+export function rejectionReviewHash(record) {
+  const p = record?.provider;
+  if (record?.status !== 'held' || record.purpose !== undefined || !Number.isFinite(Date.parse(record.completedAt)) || record.retryRequestId
+    || !p?.intentAt || !p.sessionId || !(p.reservedMicros > 0)
+    || ![429, 503].includes(p.httpStatus) || p.rejection?.httpStatus !== p.httpStatus
+    || !['rate_limit_exceeded', 'rate_limit_error', 'overloaded_error', 'api_error'].includes(p.rejection.errorCategory)
+    || p.rejection.providerErrorCode === 'enforced_spend_limit_reached') return null;
+  return hash({ id: record.id, inputHash: record.inputHash, contextRevision: record.contextRevision,
+    judge: record.judge, completedAt: record.completedAt, provider: p });
+}
 
 function evidenceOf(record) {
   const p = record.provider; const r = p?.rejection;
@@ -40,10 +53,15 @@ export function heldRecovery(state, record, now) {
   const coding = record.purpose === 'coding_review';
   const task = coding ? own(state.coding?.jobs, record.taskId) : undefined;
   const taskStopped = Boolean(task?.followThrough && terminal.has(task.followThrough.status));
+  const authority = authorityProblem(state, record, task, now);
+  const localLimit = state.reservedMicros >= state.budgetMicros || Object.values(state.requests).filter(r => r.provider).length >= attemptLimit(state);
+  const retryOffered = !coding && rejectionReviewHash(record) && !authority && !localLimit && !state.paused;
   const what = coding ? 'the automatic code review' : 'this request';
   const reserved = `Its reservation of ${dollars(e.reservedMicros)} stays counted against the allowance.`;
   const base = { evidence: e, taskId: record.taskId ?? null, taskStatus: task?.followThrough?.status ?? null, taskReason: task?.followThrough?.reason ?? null };
-  const blocked = (kind, fields) => ({ ...base, case: kind, action: 'none', acknowledgeHash: null, ...fields });
+  const blocked = (kind, fields) => ({ ...base, case: kind, action: 'none', acknowledgeHash: null, ...fields,
+    ...(retryOffered ? { whoActs: 'You (the owner)', missing: null,
+      nextStep: 'The existing proposal retry policy offers "Retry this request once". It resends this exact request once under the existing limits; this does not prove the previous attempt did no work.' } : {}) });
 
   if (!e.intentAt || !e.sessionId || !(e.reservedMicros > 0)) return blocked('unclassified', {
     whatHappened: `A held record exists for ${what}, but its send intent or reservation is incomplete.`,
@@ -67,16 +85,17 @@ export function heldRecovery(state, record, now) {
     missing: 'A parsed provider error category that matches the HTTP status.',
     nextStep: `Keep this held. The operator must check provider logs for session ${e.sessionId}. ${reserved}` });
 
-  const providerLimit = e.providerErrorCode === 'enforced_spend_limit_reached' || e.errorCategory === 'quota_for_entity_exceeded';
-  const refused = providerLimit || (refusals[e.httpStatus] ?? []).includes(e.errorCategory);
+  const providerLimit = (e.httpStatus === 402 && e.errorCategory === 'quota_for_entity_exceeded')
+    || (e.providerErrorCode === 'enforced_spend_limit_reached'
+      && ((e.httpStatus === 400 && e.errorCategory === 'invalid_request_error')
+        || (e.httpStatus === 429 && ['rate_limit_error', 'rate_limit_exceeded'].includes(e.errorCategory))));
+  const refused = (refusals[e.httpStatus] ?? []).includes(e.errorCategory);
   if (!refused) return blocked('unclassified', {
     whatHappened: `The provider answered HTTP ${e.httpStatus} (${e.errorCategory}) for ${what}.`,
     unknown: 'Whether any work was done before the failure. This category does not confirm a refusal before execution.', whoActs: 'Operator',
     missing: 'Evidence that the provider refused the request before executing it.',
     nextStep: `Keep this held. The operator must check provider logs for session ${e.sessionId}. ${reserved}` });
 
-  const authority = authorityProblem(state, record, task, now);
-  const localLimit = state.reservedMicros >= state.budgetMicros || Object.values(state.requests).filter(r => r.provider).length >= attemptLimit(state);
   const kind = providerLimit ? 'allowance_exhausted' : authority ? 'expired_authority' : localLimit ? 'allowance_exhausted' : 'confirmed_rejection';
   const whatHappened = `The provider refused ${what}: HTTP ${e.httpStatus}, ${e.providerErrorCode ?? e.errorCategory}. No ${coding ? 'review result' : 'proposal'} was produced.${coding && task?.followThrough?.reason ? ` The task's follow-through stopped: ${task.followThrough.reason}` : ''}`;
   const unknown = `Steward cannot read provider billing for this refusal. ${reserved}${coding ? ' The pull request itself is still unreviewed.' : ''}`;
@@ -86,16 +105,25 @@ export function heldRecovery(state, record, now) {
       : 'Then start a fresh request with a new request ID. Any new coding work needs its own scope approval.';
   if (!coding) {
     // Proposal requests keep the existing one-time retry policy; there is no acknowledgement for them.
-    return blocked(kind, { whatHappened, unknown, whoActs: kind === 'confirmed_rejection' ? 'You (the owner)' : 'Operator',
-      missing: kind === 'confirmed_rejection' ? null : 'Steward has no supported recovery for a held proposal request in this state.',
-      nextStep: kind === 'confirmed_rejection' ? 'Use "Retry this request once" when it is offered. It resends this exact request once under the existing limits.'
-        : `Keep this held. ${after} Clearing the hold needs an operator; there is no owner control for it.` });
+    return blocked(kind, { whatHappened, unknown, whoActs: 'Operator',
+      missing: 'Steward has no supported recovery for a held proposal request in this state.',
+      nextStep: 'Keep this held. This record cannot be acknowledged or retried with the current owner controls. The operator must inspect the recorded evidence and remaining admission limits.' });
   }
   if (!task?.followThrough) return blocked(kind, { whatHappened, unknown, whoActs: 'Operator',
     missing: 'The coding task record for this review is missing.', nextStep: 'Keep this held. The operator must inspect the stored task history; Steward cannot confirm the task stopped.' });
+  const entries = task.followThrough.reviews?.filter(r => r.id === record.id && r.headSha === record.headSha) ?? [];
+  const review = entries.length === 1 ? entries[0] : null;
+  // A crash after the transport records a refusal can leave this entry at intent.
+  // Once the controller stops the task, the completed transport evidence permits
+  // acknowledgement without rewriting or resuming that interrupted task history.
+  if (task.id !== record.taskId || task.projectId !== state.project.id || record.projectId !== state.project.id
+    || !review || !['intent', 'unknown'].includes(review.status)) return blocked(kind, { whatHappened, unknown, whoActs: 'Operator',
+    missing: 'A matching project, coding task and unresolved review entry for this exact review and commit.',
+    nextStep: 'Keep this held. The operator must inspect the stored task and review history before this refusal can be acknowledged.' });
   if (!taskStopped) return blocked(kind, { whatHappened, unknown, whoActs: 'Steward follow-through, then you',
     missing: 'The task follow-through has not stopped yet.', nextStep: 'Wait for the next follow-through check to stop this task, then refresh. Acknowledgement is offered only after the task has stopped.' });
   const acknowledgeHash = hash({ id: record.id, purpose: record.purpose, taskId: record.taskId, headSha: record.headSha, inputHash: record.inputHash,
+    projectId: record.projectId, taskProjectId: task.projectId, review,
     contextRevision: record.contextRevision, judge: record.judge, completedAt: record.completedAt, provider: p, case: kind, taskStatus: task.followThrough.status });
   return { ...base, case: kind, action: 'acknowledge', acknowledgeHash, whatHappened, unknown, whoActs: 'You (the owner)', missing: null,
     nextStep: `Acknowledge this failed review. That keeps its history and reservation, sends nothing and does not retry or resume the task. ${after}` };
