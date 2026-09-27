@@ -445,7 +445,8 @@ async function main() {
     const result = await new Promise((resolvePromise) => {
       const innerCommand = `EVE_RSV_IN_NETNS=1 HOME=${JSON.stringify(process.env.HOME)} PATH=${JSON.stringify(process.env.PATH)} CI=true ${JSON.stringify(process.execPath)} ${childArgs.map(a => JSON.stringify(a)).join(' ')}`;
       const bashScript = buildNetnsWrapperScript(innerCommand);
-      const child = spawn('unshare', ['-rn', 'bash', '-lc', bashScript], {
+      // Preserve the supplied PATH for the loopback check and child command.
+      const child = spawn('unshare', ['-rn', 'bash', '-c', bashScript], {
         stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, EVE_RSV_IN_NETNS: '1' },
       });
       let out = ''; let err = '';
