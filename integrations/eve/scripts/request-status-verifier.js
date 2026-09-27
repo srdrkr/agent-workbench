@@ -59,12 +59,8 @@ async function gitSha(cwd) {
 }
 
 async function ensureSpaBuild() {
-  try {
-    await resolveClientAssets(eveRoot);
-    return { built: false, reason: 'existing-generate-public' };
-  } catch {
-    // fall through
-  }
+  // A previous branch can leave valid but stale assets. Only --skip-build may
+  // reuse them; normal runs must exercise the current working tree's UI.
   const node = process.execPath;
   const env = {
     HOME: process.env.HOME,
