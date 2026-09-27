@@ -7,7 +7,7 @@
  * running under a network namespace.
  */
 import { mkdtemp, mkdir, writeFile, rm, readFile, access } from 'node:fs/promises';
-import { createWriteStream, existsSync } from 'node:fs';
+import { createWriteStream, existsSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -396,6 +396,11 @@ async function main() {
     // Bring up loopback inside new netns and re-exec
     const self = fileURLToPath(import.meta.url);
     const childArgs = [self, '--evidence', evidenceDir, '--skip-build'];
+    const reportPath = join(evidenceDir, 'report.json');
+    // A report.json left over from an earlier run must never be mistaken for
+    // this child's output: remove it before spawning so a crashed/short-circuited
+    // child (e.g. missing `ip`) can't have its failure masked by a stale file.
+    await rm(reportPath, { force: true });
     const result = await new Promise((resolvePromise) => {
       const bashScript = `if ! ip link set lo up 2>/dev/null; then echo '--netns: could not bring up loopback (ip missing or failed)' >&2; exit 1; fi; EVE_RSV_IN_NETNS=1 HOME=${JSON.stringify(process.env.HOME)} PATH=${JSON.stringify(process.env.PATH)} CI=true ${JSON.stringify(process.execPath)} ${childArgs.map(a => JSON.stringify(a)).join(' ')}; echo EXIT:$?`;
       const child = spawn('unshare', ['-rn', 'bash', '-lc', bashScript], {
@@ -406,13 +411,19 @@ async function main() {
       child.stderr.on('data', d => { err += d; process.stderr.write(d); });
       child.on('exit', code => resolvePromise({ code, out, err }));
     });
+    if (result.code !== 0) {
+      // The child never got to (re-)write report.json, so there is nothing
+      // trustworthy to read; honor its exit code instead of a stale/missing file.
+      console.error('netns child exited non-zero', result.code, result.err.slice(0, 500));
+      process.exit(result.code || 1);
+    }
     // Prefer report written by child (already the scrubbed, final artifact).
     try {
-      const report = JSON.parse(await readFile(join(evidenceDir, 'report.json'), 'utf8'));
+      const report = JSON.parse(await readFile(reportPath, 'utf8'));
       process.exit(report.ok ? 0 : 1);
-    } catch {
-      console.error('netns child failed', result.code, result.err.slice(0, 500));
-      process.exit(result.code || 1);
+    } catch (e) {
+      console.error('netns child exited 0 but left no valid report.json', e.message);
+      process.exit(1);
     }
   }
 
@@ -428,9 +439,23 @@ async function main() {
   process.exit(report.ok ? 0 : 1);
 }
 
-// Only run the CLI when this file is executed directly, not when imported
-// (e.g. by a unit test that just needs scrubAndWriteReport).
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+// True when this file is the process entry point, not just imported (e.g. by
+// a unit test that only needs scrubAndWriteReport). Compares real paths (not
+// just the literal argv[1] string) so launching through a symlink still
+// resolves to "this is main" instead of silently skipping main() and exiting 0.
+function isEntryPoint() {
+  if (!process.argv[1]) return false;
+  const scriptPath = fileURLToPath(import.meta.url);
+  const invokedPath = resolve(process.argv[1]);
+  if (scriptPath === invokedPath) return true;
+  try {
+    return realpathSync(scriptPath) === realpathSync(invokedPath);
+  } catch {
+    return false;
+  }
+}
+
+if (isEntryPoint()) {
   main().catch(err => {
     console.error(err);
     process.exit(1);
