@@ -566,6 +566,10 @@ async function main() {
   }
   const evidenceDir = resolve(args.evidence || join(tmpdir(), `eve-rsv-${phxStamp()}`));
   await mkdir(evidenceDir, { recursive: true });
+  const reportPath = join(evidenceDir, 'report.json');
+  // Clear prior results before building as well as before a namespace child.
+  // A failed build must not leave an older success report for this invocation.
+  await rm(reportPath, { force: true });
 
   if (!args.skipBuild) {
     const build = await ensureSpaBuild();
@@ -577,7 +581,6 @@ async function main() {
     // Bring up loopback inside new netns and re-exec
     const self = fileURLToPath(import.meta.url);
     const childArgs = [self, '--evidence', evidenceDir, '--skip-build'];
-    const reportPath = join(evidenceDir, 'report.json');
     // A report.json left over from an earlier run must never be mistaken for
     // this child's output: remove it before spawning so a crashed/short-circuited
     // child (e.g. missing `ip`) can't have its failure masked by a stale file.

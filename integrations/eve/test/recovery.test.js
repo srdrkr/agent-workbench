@@ -108,6 +108,14 @@ test('acknowledgement waits until follow-through has stopped the task', async t 
   await f.store.change(s => { const x = s.coding.jobs['synthetic-task'].followThrough; x.status = 'reviewing'; x.reason = null; x.nextCheckAt = null; x.reviews[0].status = 'intent'; });
   const waiting = (await f.steward.view()).requests.find(x => x.id === reviewId).recovery;
   assert.equal(waiting.action, 'none'); assert.equal(waiting.acknowledgeHash, null); assert.match(waiting.missing, /not stopped/);
+  const pending = await f.store.read();
+  for (const pause of [s => { s.paused = true; }, s => { s.coding.paused = true; }, s => { delete s.pilot; }]) {
+    const paused = structuredClone(pending); pause(paused);
+    const handoff = heldRecovery(paused, paused.requests[reviewId], f.now());
+    assert.equal(handoff.action, 'none'); assert.equal(handoff.whoActs, 'Operator');
+    assert.match(handoff.missing, /cannot stop this task automatically/);
+    assert.doesNotMatch(handoff.nextStep, /Wait for the next/);
+  }
   await assert.rejects(f.steward.acknowledgeRejectedReview({ requestId: reviewId, acknowledgeHash: 'e'.repeat(64) }), /RECOVERY_TASK_ACTIVE/);
   await new FollowThrough({ store: f.store, now: f.now, coding: { reconcile: () => assert.fail('no reconcile') }, review: () => assert.fail('no review') }).run();
   const ready = (await f.steward.view()).requests.find(x => x.id === reviewId).recovery;
@@ -218,6 +226,19 @@ test('a refused proposal keeps the existing one-time retry and has no acknowledg
   assert.ok(shown.retryReviewHash); assert.equal(shown.recovery.case, 'unclassified');
   assert.match(shown.recovery.nextStep, /Retry this request once/);
   assert.match(shown.recovery.unknown, /Whether any work was done/);
+  const retryable = await store.read();
+  for (const block of [
+    s => { s.requests.other = { id: 'other', status: 'held' }; },
+    s => { s.requests.other = { id: 'other', status: 'thinking' }; },
+    s => { s.requests[record.id].judge = 'another-model'; },
+    s => { s.requests[record.id].provider.rejection.retryAfter = { kind: 'seconds', seconds: 60 }; },
+    s => { s.requests[record.id].provider.rejection.retryAfter = { kind: 'date', at: '2026-09-24T13:00:00.000Z' }; },
+  ]) {
+    const blocked = structuredClone(retryable); block(blocked);
+    const handoff = heldRecovery(blocked, blocked.requests[record.id], now());
+    assert.equal(handoff.whoActs, 'Operator');
+    assert.doesNotMatch(handoff.nextStep, /Retry this request once/);
+  }
 });
 
 test('refusal classification binds the status to its category, including provider limits', async t => {

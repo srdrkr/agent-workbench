@@ -55,7 +55,13 @@ export function heldRecovery(state, record, now) {
   const taskStopped = Boolean(task?.followThrough && terminal.has(task.followThrough.status));
   const authority = authorityProblem(state, record, task, now);
   const localLimit = state.reservedMicros >= state.budgetMicros || Object.values(state.requests).filter(r => r.provider).length >= attemptLimit(state);
-  const retryOffered = !coding && rejectionReviewHash(record) && !authority && !localLimit && !state.paused;
+  const retryAfter = p?.rejection?.retryAfter;
+  const retryAt = retryAfter?.kind === 'date' ? Date.parse(retryAfter.at)
+    : retryAfter?.kind === 'seconds' ? Date.parse(record.completedAt) + retryAfter.seconds * 1000 : 0;
+  const retryOffered = !coding && rejectionReviewHash(record) && !authority && !localLimit && !state.paused
+    && record.projectId === state.project.id && record.judge === state.model && Object.keys(state.requests).length < 500
+    && Number.isFinite(retryAt) && Date.parse(now) >= retryAt
+    && !Object.values(state.requests).some(r => r !== record && ['held', 'thinking'].includes(r.status));
   const what = coding ? 'the automatic code review' : 'this request';
   const reserved = `Its reservation of ${dollars(e.reservedMicros)} stays counted against the allowance.`;
   const base = { evidence: e, taskId: record.taskId ?? null, taskStatus: task?.followThrough?.status ?? null, taskReason: task?.followThrough?.reason ?? null };
@@ -120,6 +126,9 @@ export function heldRecovery(state, record, now) {
     || !review || !['intent', 'unknown'].includes(review.status)) return blocked(kind, { whatHappened, unknown, whoActs: 'Operator',
     missing: 'A matching project, coding task and unresolved review entry for this exact review and commit.',
     nextStep: 'Keep this held. The operator must inspect the stored task and review history before this refusal can be acknowledged.' });
+  if (!taskStopped && (state.paused || state.coding?.paused || !state.pilot)) return blocked(kind, { whatHappened, unknown, whoActs: 'Operator',
+    missing: 'Follow-through is paused or has no pilot; it cannot stop this task automatically.',
+    nextStep: 'Keep this held. The operator must reconcile the interrupted task and restore a supported recovery path; waiting for a scheduled check will not resolve it.' });
   if (!taskStopped) return blocked(kind, { whatHappened, unknown, whoActs: 'Steward follow-through, then you',
     missing: 'The task follow-through has not stopped yet.', nextStep: 'Wait for the next follow-through check to stop this task, then refresh. Acknowledgement is offered only after the task has stopped.' });
   const acknowledgeHash = hash({ id: record.id, purpose: record.purpose, taskId: record.taskId, headSha: record.headSha, inputHash: record.inputHash,
