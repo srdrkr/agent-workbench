@@ -10,7 +10,7 @@ import { mkdtemp, mkdir, writeFile, rm, readFile, access } from 'node:fs/promise
 import { createWriteStream, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawn, execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
 import { chromium } from 'playwright';
@@ -109,6 +109,31 @@ async function withFixture(evidenceDir, fn) {
     }
   }
   return { result, cleanup };
+}
+
+/**
+ * The single final write of report.json: scrubs `report` against `secrets`,
+ * writes the scrubbed text, then greps the evidence directory for any
+ * remaining occurrence of a secret. Callers must not write report.json
+ * again after this returns, or the leak check stops covering what's
+ * actually left on disk.
+ */
+export async function scrubAndWriteReport(evidenceDir, report, secrets) {
+  const raw = JSON.stringify(report, null, 2);
+  const scrubbed = scrubArtifactText(raw, secrets);
+  await writeFile(join(evidenceDir, 'report.json'), scrubbed);
+  const leakCheck = { checkedAt: phxNow(), leaks: [] };
+  for (const secret of secrets) {
+    if (!secret) continue;
+    const { stdout } = await execFile('bash', ['-lc', `grep -R --fixed-strings -l -- ${JSON.stringify(secret)} ${JSON.stringify(evidenceDir)} 2>/dev/null || true`]);
+    if (stdout.trim()) leakCheck.leaks.push({ hint: secret.slice(0, 4) + '…', files: stdout.trim().split('\n') });
+  }
+  await writeFile(join(evidenceDir, 'scrub-check.json'), JSON.stringify(leakCheck, null, 2));
+  if (leakCheck.leaks.length) {
+    report.ok = false;
+    report.scrubFailure = leakCheck;
+  }
+  return report;
 }
 
 async function installBrowserRoute(context, fixture, scenarioFailures) {
@@ -230,7 +255,7 @@ async function scenarioBlocked({ fixture, page, shots }) {
   return assertions;
 }
 
-async function runOnce({ evidenceDir, netnsReported }) {
+async function runOnce({ evidenceDir, netnsReported, netnsAvailable }) {
   const started = Date.now();
   const headSha = await gitSha(repoRoot);
   const baseSha = '342070c0e3c2e09205f4c8df38b3eb7f63644772';
@@ -341,22 +366,15 @@ async function runOnce({ evidenceDir, netnsReported }) {
     secretsScrubNote: 'Owner email/password/auth secret generated per fixture and never written into this report.',
   };
 
-  const raw = JSON.stringify(report, null, 2);
-  const scrubbed = scrubArtifactText(raw, secrets);
-  await writeFile(join(evidenceDir, 'report.json'), scrubbed);
-  // Grep evidence dir for secrets
-  const leakCheck = { checkedAt: phxNow(), leaks: [] };
-  for (const secret of secrets) {
-    if (!secret) continue;
-    const { stdout } = await execFile('bash', ['-lc', `grep -R --fixed-strings -l -- ${JSON.stringify(secret)} ${JSON.stringify(evidenceDir)} 2>/dev/null || true`]);
-    if (stdout.trim()) leakCheck.leaks.push({ hint: secret.slice(0, 4) + '…', files: stdout.trim().split('\n') });
+  report.networkCoverage = report.networkCoverage || {};
+  report.networkCoverage.netnsAvailable = netnsAvailable;
+  report.networkCoverage.netns = Boolean(netnsReported);
+  if (netnsReported) {
+    report.networkCoverage.netnsNote = 'verification re-exec under unshare -rn with lo up';
   }
-  await writeFile(join(evidenceDir, 'scrub-check.json'), JSON.stringify(leakCheck, null, 2));
-  if (leakCheck.leaks.length) {
-    report.ok = false;
-    report.scrubFailure = leakCheck;
-  }
-  return report;
+
+  // This is the final write: nothing after this call may touch report.json.
+  return scrubAndWriteReport(evidenceDir, report, secrets);
 }
 
 async function main() {
@@ -379,7 +397,8 @@ async function main() {
     const self = fileURLToPath(import.meta.url);
     const childArgs = [self, '--evidence', evidenceDir, '--skip-build'];
     const result = await new Promise((resolvePromise) => {
-      const child = spawn('unshare', ['-rn', 'bash', '-lc', `ip link set lo up 2>/dev/null || true; EVE_RSV_IN_NETNS=1 HOME=${JSON.stringify(process.env.HOME)} PATH=${JSON.stringify(process.env.PATH)} CI=true ${JSON.stringify(process.execPath)} ${childArgs.map(a => JSON.stringify(a)).join(' ')}; echo EXIT:$?`], {
+      const bashScript = `if ! ip link set lo up 2>/dev/null; then echo '--netns: could not bring up loopback (ip missing or failed)' >&2; exit 1; fi; EVE_RSV_IN_NETNS=1 HOME=${JSON.stringify(process.env.HOME)} PATH=${JSON.stringify(process.env.PATH)} CI=true ${JSON.stringify(process.execPath)} ${childArgs.map(a => JSON.stringify(a)).join(' ')}; echo EXIT:$?`;
+      const child = spawn('unshare', ['-rn', 'bash', '-lc', bashScript], {
         stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, EVE_RSV_IN_NETNS: '1' },
       });
       let out = ''; let err = '';
@@ -387,13 +406,9 @@ async function main() {
       child.stderr.on('data', d => { err += d; process.stderr.write(d); });
       child.on('exit', code => resolvePromise({ code, out, err }));
     });
-    // Prefer report written by child
+    // Prefer report written by child (already the scrubbed, final artifact).
     try {
       const report = JSON.parse(await readFile(join(evidenceDir, 'report.json'), 'utf8'));
-      report.networkCoverage = report.networkCoverage || {};
-      report.networkCoverage.netns = true;
-      report.networkCoverage.netnsNote = 'verification re-exec under unshare -rn with lo up';
-      await writeFile(join(evidenceDir, 'report.json'), JSON.stringify(report, null, 2));
       process.exit(report.ok ? 0 : 1);
     } catch {
       console.error('netns child failed', result.code, result.err.slice(0, 500));
@@ -408,16 +423,16 @@ async function main() {
     netnsAvailable = true;
   } catch { netnsAvailable = false; }
 
-  const report = await runOnce({ evidenceDir, netnsReported: process.env.EVE_RSV_IN_NETNS === '1' });
-  report.networkCoverage = report.networkCoverage || {};
-  report.networkCoverage.netnsAvailable = netnsAvailable;
-  report.networkCoverage.netns = process.env.EVE_RSV_IN_NETNS === '1';
-  await writeFile(join(evidenceDir, 'report.json'), JSON.stringify(report, null, 2));
+  const report = await runOnce({ evidenceDir, netnsReported: process.env.EVE_RSV_IN_NETNS === '1', netnsAvailable });
   console.log(JSON.stringify({ ok: report.ok, evidenceDir, scenarios: report.scenarios.map(s => ({ name: s.name, ok: s.ok, error: s.error })) }, null, 2));
   process.exit(report.ok ? 0 : 1);
 }
 
-main().catch(err => {
-  console.error(err);
-  process.exit(1);
-});
+// Only run the CLI when this file is executed directly, not when imported
+// (e.g. by a unit test that just needs scrubAndWriteReport).
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch(err => {
+    console.error(err);
+    process.exit(1);
+  });
+}

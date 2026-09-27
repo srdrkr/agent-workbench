@@ -394,22 +394,6 @@ export async function startRequestStatusFixture({
         ],
       };
     },
-    browserRouteHandler: async (route) => {
-      const req = route.request();
-      const url = new URL(req.url());
-      if (url.protocol === 'data:' || url.protocol === 'blob:') {
-        await route.continue();
-        return;
-      }
-      if (url.origin === origin) {
-        await route.continue();
-        return;
-      }
-      const entry = { at: new Date().toISOString(), source: 'browser', url: url.href, method: req.method() };
-      blockedBrowser.push(entry);
-      await route.abort('blockedbyclient');
-      throw new Error(`BROWSER_NETWORK_DENIED:${url.href}`);
-    },
     async close() {
       await new Promise(resolveClose => server.close(resolveClose));
       networkGuard?.restore();
