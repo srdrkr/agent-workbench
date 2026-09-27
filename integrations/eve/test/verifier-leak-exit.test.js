@@ -109,7 +109,7 @@ test('netns wrapper script forwards the inner command\'s exit code, not echo\'s'
       // the point of this test.
       const script = buildNetnsWrapperScript(`bash -c "exit ${innerExit}"`);
       const code = await new Promise((resolvePromise) => {
-        const child = spawn('bash', ['-lc', script], {
+        const child = spawn('bash', ['-c', script], {
           env: { ...process.env, PATH: `${fakeBinDir}:${process.env.PATH}` },
           stdio: ['ignore', 'ignore', 'ignore'],
         });
@@ -131,7 +131,7 @@ test('netns wrapper script still fails loudly when the loopback check itself fai
 
     const script = buildNetnsWrapperScript('exit 0');
     const { code, stderr } = await new Promise((resolvePromise) => {
-      const child = spawn('bash', ['-lc', script], {
+      const child = spawn('bash', ['-c', script], {
         env: { ...process.env, PATH: `${fakeBinDir}:${process.env.PATH}` },
       });
       let err = '';
