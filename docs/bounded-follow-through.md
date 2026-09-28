@@ -61,22 +61,33 @@ parsed from the provider's error body.
 
 | Case | Evidence Steward has | Result |
 |---|---|---|
-| Confirmed refusal | HTTP 400/401/403/404/413/429/503/529 with a matching parsed error category, a complete intent and a reservation | The owner can acknowledge it once the task's follow-through has stopped |
+| Confirmed refusal | HTTP 400/401/402/403/404/413/429/503/529 with a matching parsed refusal category, a complete intent and a reservation | The owner can acknowledge it once the task's follow-through has stopped |
 | Expired authority | A confirmed refusal, but the task grant or the brief is no longer current | Acknowledgement is allowed. It never resumes the grant; new work needs a fresh brief and approval |
-| Allowance exhausted | The provider spend limit (`enforced_spend_limit_reached`, `quota_for_entity_exceeded`) or the local allowance is used up | Acknowledgement is allowed. It never refills the allowance |
+| Allowance exhausted | HTTP 402 with `quota_for_entity_exceeded`, or a 400 invalid-request / 429 rate-limit refusal carrying `enforced_spend_limit_reached`, or the local allowance is used up | Acknowledgement is allowed. It never refills the allowance |
 | Uncertain delivery | An intent was recorded but no HTTP response | Stays held. An operator must check provider usage for the session |
 | Unverified output | A 2xx response but no validated result; the raw output is not retained | Stays held. An operator must check provider logs |
-| Unclassified | A status without a recognized error body, or a category that does not confirm a refusal (for example 500) | Stays held |
+| Unclassified | A status without a recognized error body, a mismatched status/category, or a category that does not confirm a refusal (including 500 and 503 `api_error`) | Coding reviews stay held |
+
+Provider-limit classification follows the [Vercel budget response](https://vercel.com/docs/ai-gateway/observability-and-spend/budgets)
+and [Anthropic error categories](https://platform.claude.com/docs/en/api/errors).
+A generic internal error does not establish that execution never began. In particular,
+the coding-review acknowledgement list does not inherit the broader proposal-retry policy.
 
 `POST /api/steward/recovery/acknowledge` with `{ requestId, acknowledgeHash }` is owner-authenticated
-like every other steward route. The hash binds the record, its provider evidence, the case
-and the task status. Any change makes it stale. The acknowledgement sets the record to
+like every other steward route. The record and task must belong to the current project,
+and the task must contain one unresolved review entry for this exact request ID and commit.
+The hash binds the record, its provider evidence, the case, the task status and that review entry.
+A change to those bound facts makes it stale. An interrupted review entry can still say
+`intent` after follow-through stops; its completed transport refusal supports acknowledgement
+without rewriting that task history. The acknowledgement sets the record to
 `rejection_acknowledged` and adds one `held_rejection_acknowledged` event. It keeps the
 provider record, the reservation and the task history, and it sends no model or Routine
 request. Repeating it returns the same record. There is no retry, no resumed grant and no
 general "clear held" control. The owner's next step is a fresh request with a new request
 ID, which goes through normal proposal and approval.
 
-Held **proposal** requests keep the existing one-time retry for rate-limit or overload
-refusals. Steward has no owner acknowledgement for them. A held proposal whose brief
-expired stays held, and the operator must resolve it.
+Held **proposal** requests keep the existing explicit one-time retry policy, including
+503 `api_error`. A retry is not proof that the prior attempt did no work. The handoff uses
+the same eligibility predicate as the retry control and names the operator when that
+control is unavailable. Steward has no owner acknowledgement for proposals. A held
+proposal whose brief expired stays held, and the operator must resolve it.

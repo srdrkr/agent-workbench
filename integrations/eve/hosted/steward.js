@@ -4,25 +4,14 @@ import { createHash } from 'node:crypto';
 import { attemptLimit, continuationPacket, reviewContinuation, approveContinuation, judgmentProject } from './continuation.js';
 import { previewContext, applyContext } from './context.js';
 import { validateProject, validateProposal } from '../../../src/steward-policy.js';
-import { heldRecovery, acknowledgeRejectedReview } from './recovery.js';
+import { heldRecovery, acknowledgeRejectedReview, rejectionReviewHash } from './recovery.js';
+export { rejectionReviewHash } from './recovery.js';
 
 export const digest = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 export const fresh = (project, now) => project.sources.every(s => Date.parse(s.observedAt) <= Date.parse(now) && Date.parse(s.expiresAt) > Date.parse(now));
 const validId = value => typeof value === 'string' && /^[a-z0-9][a-z0-9-]{0,63}$/.test(value);
 const requireValue = (condition, message) => { if (!condition) throw new Error(message); };
 const event = (state, kind, data, at) => state.events.push({ seq: state.events.length + 1, kind, data, at });
-
-export function rejectionReviewHash(record) {
-  const p = record?.provider;
-  // Only proposal requests can be retried; a coding review is never resent as a proposal.
-  if (record?.status !== 'held' || record.purpose !== undefined || !Number.isFinite(Date.parse(record.completedAt)) || record.retryRequestId
-    || !p?.intentAt || !p.sessionId || !(p.reservedMicros > 0)
-    || ![429, 503].includes(p.httpStatus) || p.rejection?.httpStatus !== p.httpStatus
-    || !['rate_limit_exceeded', 'rate_limit_error', 'overloaded_error', 'api_error'].includes(p.rejection.errorCategory)
-    || p.rejection.providerErrorCode === 'enforced_spend_limit_reached') return null;
-  return digest({ id: record.id, inputHash: record.inputHash, contextRevision: record.contextRevision,
-    judge: record.judge, completedAt: record.completedAt, provider: p });
-}
 
 export function initialState(project, { model, budgetMicros }) {
   validateProject(project);
