@@ -14,6 +14,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawn, execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
 import { chromium } from 'playwright';
+import { scenarioLostSubmission, scenarioRecoveryStatusEdges } from './progress-edge-scenarios.js';
 import {
   startRequestStatusFixture,
   PROPOSAL_OK,
@@ -288,6 +289,9 @@ async function scenarioRejectedReviewRecovery({ fixture, page, shots }) {
   pass('ask-blocked-while-held', true);
   if (await page.getByRole('button', { name: 'Retry this request once' }).count()) fail('coding-review-must-not-offer-retry', 'retry shown');
   pass('no-proposal-retry-for-coding-review', true);
+  const heldSummary = await page.locator('p.summary[data-owner-state="blocked"]').innerText().catch(() => '');
+  if (!/Next: acknowledge the failed review in the web app\./.test(heldSummary)) fail('summary-disagrees-with-handoff', heldSummary);
+  pass('summary-agrees-with-handoff', heldSummary);
   await shots.held();
   const ack = page.getByRole('button', { name: 'Acknowledge failed review' });
   try { await ack.waitFor({ timeout: 10000 }); } catch { fail('missing-acknowledge-control', 'Acknowledge failed review button absent'); }
@@ -312,6 +316,9 @@ async function scenarioRejectedReviewRecovery({ fixture, page, shots }) {
   catch { fail('acknowledgement-not-persisted', 'label missing after reload'); }
   if (await page.getByRole('button', { name: 'Acknowledge failed review' }).count()) fail('acknowledge-still-offered', 'after reload');
   pass('acknowledgement-persisted-after-reload', true);
+  const readySummary = await page.locator('p.summary[data-owner-state="awaiting_decision"]').innerText().catch(() => '');
+  if (!/Next: review the PR yourself or start a fresh request; the failed review stays in history/.test(readySummary)) fail('summary-disagrees-after-acknowledge', readySummary);
+  pass('summary-agrees-after-acknowledge', readySummary);
   const fresh = page.getByRole('button', { name: 'Start a fresh request' });
   try { await fresh.waitFor({ timeout: 10000 }); } catch { fail('missing-next-step', 'Start a fresh request button absent'); }
   await fresh.click();
@@ -349,6 +356,9 @@ async function scenarioUncertainReviewBlocked({ fixture, page, shots }) {
   if (await page.getByRole('button', { name: 'Retry this request once' }).count()) fail('uncertain-must-not-offer-retry', 'shown');
   if (!(await page.getByLabel('Request to Eve').isDisabled())) fail('uncertain-must-block-new-requests', 'ask enabled');
   pass('uncertain-offers-no-recovery-and-blocks-requests', true);
+  const uncertainSummary = await page.locator('p.summary[data-owner-state="blocked"]').innerText().catch(() => '');
+  if (!/Next: operator: check provider usage for the held attempt; do not resend/.test(uncertainSummary)) fail('summary-disagrees-with-uncertain-handoff', uncertainSummary);
+  pass('summary-agrees-with-uncertain-handoff', uncertainSummary);
   await shots.uncertain();
   const callsBefore = fixture.modelCalls();
   const direct = await page.evaluate(async id => {
@@ -363,6 +373,125 @@ async function scenarioUncertainReviewBlocked({ fixture, page, shots }) {
   return kit.assertions;
 }
 
+// Reads every status surface at once, so each checkpoint is one consistent observation.
+async function surfaces(page) {
+  return page.evaluate(() => {
+    const text = el => (el ? el.innerText.replace(/\s+/g, ' ').trim() : null);
+    const summary = document.querySelector('p.summary');
+    const ask = document.querySelector('section.ask');
+    return {
+      ownerState: summary?.dataset.ownerState ?? null, summary: text(summary),
+      button: text(ask?.querySelector('button')), buttonDisabled: Boolean(ask?.querySelector('button')?.disabled),
+      requestDisabled: Boolean(document.getElementById('request')?.disabled),
+      askNotice: text(ask?.querySelector('p.notice')),
+      cards: [...document.querySelectorAll('article.decision')].map(a => ({ tag: text(a.querySelector('.tag')), body: text(a) })),
+    };
+  });
+}
+
+// Invariants per owner state: every surface must tell the same story.
+function agreement(s, key) {
+  const problems = [];
+  if (s.ownerState !== key) problems.push(`summary state ${s.ownerState} != ${key}`);
+  const all = [s.summary, s.button, s.askNotice, ...s.cards.map(c => c.body)].filter(Boolean).join(' | ');
+  if (key === 'working') {
+    if (!/^State: In progress\./.test(s.summary)) problems.push('summary does not say In progress');
+    if (/ask Eve for the next useful step|ask again|send it again\b(?! is)|submit a new request/i.test(all.replace(/you do not need to send it again|no need to send the request again/gi, ''))) problems.push('a surface invites resending');
+    if (!['Working…', 'Eve is working…'].includes(s.button) || !s.buttonDisabled || !s.requestDisabled) problems.push(`ask panel not working: ${s.button}`);
+    if (!/you do not need to send it again/.test(s.askNotice ?? '')) problems.push('ask notice does not say the request is in progress');
+    if (s.cards[0]?.tag !== 'WAITING FOR EVE' && s.cards[0]?.tag !== 'Waiting for Eve') problems.push(`newest card is ${s.cards[0]?.tag}`);
+  }
+  if (key === 'awaiting_decision') {
+    if (!/^State: Your decision needed\./.test(s.summary) || !/Next: decide on the proposal/.test(s.summary)) problems.push('summary does not ask for a decision');
+    if (/\b(done|executed|completed)\b/i.test(s.summary)) problems.push('proposal described as executed');
+    if (s.button !== 'Ask Eve') problems.push(`button ${s.button}`);
+    if (!/your decision/i.test(s.cards[0]?.tag ?? '')) problems.push(`newest card is ${s.cards[0]?.tag}`);
+  }
+  if (key === 'decision_recorded') {
+    if (!/^State: Decision recorded\./.test(s.summary) || !/Next: /.test(s.summary)) problems.push('summary lacks recorded decision and next step');
+    if (!/committed/i.test(s.cards[0]?.tag ?? '')) problems.push(`newest card is ${s.cards[0]?.tag}`);
+  }
+  if (key === 'blocked') {
+    if (!/^State: Blocked\./.test(s.summary) || !/Next: (review the held attempt|operator: |acknowledge the failed review)/.test(s.summary)) problems.push('summary not blocked with next step');
+    if (!/needs review/.test(s.askNotice ?? '')) problems.push('ask notice does not name the held attempt');
+    if (!/needs operator review/i.test(s.cards[0]?.tag ?? '')) problems.push(`newest card is ${s.cards[0]?.tag}`);
+  }
+  return problems;
+}
+
+async function expectAgreement(page, key, name, kit, timeline) {
+  // Wait on the DOM (no sleeps) until the summary reports the state, then check every surface.
+  await page.locator(`p.summary[data-owner-state="${key}"]`).waitFor({ timeout: 20000 }).catch(() => {});
+  const s = await surfaces(page);
+  timeline.push({ checkpoint: name, at: new Date().toISOString(), ...s });
+  const problems = agreement(s, key);
+  if (problems.length) kit.fail(`surfaces-disagree:${name}`, `${problems.join('; ')} :: summary="${s.summary}" button="${s.button}"`);
+  kit.pass(`surfaces-agree:${name}`, { summary: s.summary, button: s.button, askNotice: s.askNotice, newestCard: s.cards[0]?.tag });
+}
+
+async function scenarioProgressWorking({ fixture, page, shots, timeline }) {
+  const kit = assertionKit();
+  await login(page, fixture);
+  await page.locator('p.summary[data-owner-state="ready"]').waitFor({ timeout: 20000 });
+  kit.pass('initial-ready', await page.locator('p.summary').innerText());
+  fixture.judge.hold();
+  await page.getByLabel('Request to Eve').fill('What is the next useful step for link normalization?');
+  const called = fixture.judge.waitUntilCalled({ timeoutMs: 20000 });
+  await page.getByRole('button', { name: 'Ask Eve' }).click();
+  await called;
+  // No poll has run yet: the first observation must already agree.
+  const immediate = await surfaces(page);
+  timeline.push({ checkpoint: 'immediately-after-submit', at: new Date().toISOString(), ...immediate });
+  const early = agreement(immediate, 'working');
+  if (early.length) kit.fail('surfaces-disagree:immediately-after-submit', `${early.join('; ')} :: summary="${immediate.summary}" button="${immediate.button}"`);
+  kit.pass('surfaces-agree:immediately-after-submit', { summary: immediate.summary, button: immediate.button });
+  await shots.working();
+  // Manual refresh is available while the request runs and returns the durable record.
+  const refresh = page.getByRole('button', { name: 'Refresh status' });
+  if (await refresh.isDisabled()) kit.fail('refresh-disabled-while-working', 'Refresh status disabled');
+  await refresh.click();
+  await page.getByText('Eve is working on this request.').first().waitFor({ timeout: 20000 });
+  await expectAgreement(page, 'working', 'after-manual-refresh', kit, timeline);
+  // Reload mid-judge restores the durable working state.
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await page.getByText('YOUR WORKSPACE').waitFor({ timeout: 20000 });
+  await expectAgreement(page, 'working', 'after-reload-mid-judge', kit, timeline);
+  if ((await page.getByRole('button', { name: 'Eve is working…' }).count()) !== 1) kit.fail('reload-button-not-working', 'no Eve is working… button');
+  await shots.reload();
+  if (fixture.judge.calls !== 1) kit.fail('duplicate-admission', `judge calls ${fixture.judge.calls}`);
+  kit.pass('single-admission-after-reload', fixture.judge.calls);
+  fixture.judge.release(PROPOSAL_OK);
+  await page.getByRole('heading', { name: 'Confirm the normalization priority' }).waitFor({ timeout: 20000 });
+  await expectAgreement(page, 'awaiting_decision', 'after-release', kit, timeline);
+  await shots.awaiting();
+  await page.getByRole('button', { name: 'Approve commitment' }).click();
+  await page.getByText('Committed', { exact: true }).first().waitFor({ timeout: 20000 });
+  await expectAgreement(page, 'decision_recorded', 'after-approval', kit, timeline);
+  if (!/Next: work on: Confirm the normalization priority/.test(await page.locator('p.summary').innerText())) kit.fail('completed-next-step', 'missing work on');
+  await shots.completed();
+  if (fixture.judge.calls !== 1) kit.fail('duplicate-admission', `judge calls ${fixture.judge.calls}`);
+  return kit.assertions;
+}
+
+async function scenarioProgressBlocked({ fixture, page, shots, timeline }) {
+  const kit = assertionKit();
+  await login(page, fixture);
+  fixture.judge.hold();
+  await page.getByLabel('Request to Eve').fill('Please advise on the next step.');
+  const called = fixture.judge.waitUntilCalled({ timeoutMs: 20000 });
+  await page.getByRole('button', { name: 'Ask Eve' }).click();
+  await called;
+  await expectAgreement(page, 'working', 'blocked-scenario-working', kit, timeline);
+  fixture.judge.releaseHeld();
+  await page.getByText('Needs operator review').first().waitFor({ timeout: 20000 });
+  await expectAgreement(page, 'blocked', 'after-held', kit, timeline);
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await page.getByText('YOUR WORKSPACE').waitFor({ timeout: 20000 });
+  await expectAgreement(page, 'blocked', 'held-after-reload', kit, timeline);
+  await shots.blocked();
+  return kit.assertions;
+}
+
 async function runScenario({ name, evidenceDir, secrets, scenarios, scenarioFailures, cleanupResults, failureShot, body }) {
   const { cleanup } = await withFixture(evidenceDir, async ({ fixture, browser }) => {
     secrets.push(fixture.getOwnerLogin().email, fixture.getOwnerLogin().password, fixture._credentials.secret);
@@ -370,10 +499,10 @@ async function runScenario({ name, evidenceDir, secrets, scenarios, scenarioFail
     const routeFailures = [];
     await installBrowserRoute(context, fixture, routeFailures);
     const page = await context.newPage();
-    const sc = { name, startedAt: phxNow(), ok: false, assertions: [], error: null, durationMs: 0 };
+    const sc = { name, startedAt: phxNow(), ok: false, assertions: [], timeline: [], error: null, durationMs: 0 };
     const t0 = Date.now();
     try {
-      sc.assertions = await body({ fixture, page });
+      sc.assertions = await body({ fixture, page, timeline: sc.timeline });
       if (routeFailures.length) throw new Error(`network-boundary:${routeFailures.join(';')}`);
       if (fixture.blockedBrowser.length || fixture.blockedNode.length) throw new Error(`blocked-network:${JSON.stringify([...fixture.blockedBrowser, ...fixture.blockedNode])}`);
       sc.ok = sc.assertions.every(a => a.ok);
@@ -382,7 +511,7 @@ async function runScenario({ name, evidenceDir, secrets, scenarios, scenarioFail
       try { await page.screenshot({ path: join(evidenceDir, failureShot), fullPage: true }); } catch { /* ignore */ }
     } finally {
       sc.durationMs = Date.now() - t0; sc.finishedAt = phxNow();
-      sc.modelCalls = fixture.modelCalls();
+      sc.modelCalls = fixture.modelCalls(); sc.judgeCalls = fixture.judge.calls;
       scenarios.push(sc);
       await context.close();
     }
@@ -511,6 +640,17 @@ async function runOnce({ evidenceDir, netnsReported, netnsAvailable }) {
   await runScenario({ ...shared, name: 'held-uncertain-review-blocked', failureShot: '08-failure.png', body: ({ fixture, page }) => scenarioUncertainReviewBlocked({ fixture, page, shots: {
     uncertain: () => page.screenshot({ path: join(evidenceDir, '08-uncertain-still-blocked.png'), fullPage: true }),
   } }) });
+
+  const shot = (page, file) => () => page.screenshot({ path: join(evidenceDir, file), fullPage: true });
+  await runScenario({ ...shared, name: 'progress-consistency-working', failureShot: '09-failure.png', body: ({ fixture, page, timeline }) => scenarioProgressWorking({ fixture, page, timeline, shots: {
+    working: shot(page, '09-working-immediately.png'), reload: shot(page, '10-working-after-reload.png'),
+    awaiting: shot(page, '11-awaiting-decision.png'), completed: shot(page, '12-completed-next-step.png') } }) });
+  await runScenario({ ...shared, name: 'progress-consistency-blocked', failureShot: '13-failure.png', body: ({ fixture, page, timeline }) => scenarioProgressBlocked({ fixture, page, timeline, shots: {
+    blocked: shot(page, '13-blocked-next-step.png') } }) });
+  await runScenario({ ...shared, name: 'progress-lost-submission', failureShot: '14-failure.png',
+    body: args => scenarioLostSubmission({ ...args, kit: assertionKit(), login }) });
+  await runScenario({ ...shared, name: 'progress-recovery-status-edges', failureShot: '15-failure.png',
+    body: args => scenarioRecoveryStatusEdges({ ...args, kit: assertionKit(), login }) });
 
   const report = {
     generatedAt: phxNow(),

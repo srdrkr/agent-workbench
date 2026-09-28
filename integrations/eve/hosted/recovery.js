@@ -64,7 +64,7 @@ export function heldRecovery(state, record, now) {
     && !Object.values(state.requests).some(r => r !== record && ['held', 'thinking'].includes(r.status));
   const what = coding ? 'the automatic code review' : 'this request';
   const reserved = `Its reservation of ${dollars(e.reservedMicros)} stays counted against the allowance.`;
-  const base = { evidence: e, taskId: record.taskId ?? null, taskStatus: task?.followThrough?.status ?? null, taskReason: task?.followThrough?.reason ?? null };
+  const base = { evidence: e, canRetry: Boolean(retryOffered), taskId: record.taskId ?? null, taskStatus: task?.followThrough?.status ?? null, taskReason: task?.followThrough?.reason ?? null };
   const blocked = (kind, fields) => ({ ...base, case: kind, action: 'none', acknowledgeHash: null, ...fields,
     ...(retryOffered ? { whoActs: 'You (the owner)', missing: null,
       nextStep: 'The existing proposal retry policy offers "Retry this request once". It resends this exact request once under the existing limits; this does not prove the previous attempt did no work.' } : {}) });

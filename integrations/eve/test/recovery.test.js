@@ -10,6 +10,7 @@ import { ownerAuth } from '../hosted/auth.js';
 import { hostedHandler } from '../hosted/http.js';
 import { setupHosted } from '../hosted/setup.js';
 import { seedSyntheticTask, runSyntheticReview } from './held-review-fixture.js';
+import { statusSummary, ownerState } from '../shared/status-summary.js';
 import { heldRecovery } from '../hosted/recovery.js';
 
 const project = JSON.parse(await readFile(new URL('../../../fixtures/steward-project.json', import.meta.url)));
@@ -349,4 +350,53 @@ test('the acknowledge route is owner-authenticated, origin-checked and idempoten
   const second = await handle(req('/api/steward/recovery/acknowledge', body, cookie)); assert.equal(second.status, 200);
   assert.deepEqual(await second.json(), await first.json()); assert.equal(sent(f), calls);
   assert.equal((await f.store.read()).events.filter(e => e.kind === 'held_rejection_acknowledged').length, 1);
+});
+
+test('status summary and Telegram text follow the recovery case and the acknowledged state', async t => {
+  const f = await fixture(t);
+  const { reviewId, record } = await held(f, 'refused');
+  let view = await f.steward.view(); let text = statusSummary(view, { state: true });
+  assert.equal(ownerState(view).key, 'blocked');
+  assert.match(text, /^State: Blocked\. .*Blocker: provider refused a held attempt\. Next: acknowledge the failed review in the web app\./);
+  assert.doesNotMatch(text, /needs review/);
+  await f.steward.acknowledgeRejectedReview({ requestId: reviewId, acknowledgeHash: record.recovery.acknowledgeHash });
+  view = await f.steward.view(); text = statusSummary(view, { state: true });
+  assert.equal(ownerState(view).key, 'awaiting_decision');
+  assert.match(text, /^State: Your decision needed\. .*Blocker: none recorded\. Next: review the PR yourself or start a fresh request; the failed review stays in history\./);
+
+  const g = await fixture(t);
+  await held(g, 'lost');
+  text = statusSummary(await g.steward.view(), { state: true });
+  assert.match(text, /^State: Blocked\. .*Blocker: held attempt outcome unknown\. Next: operator: check provider usage for the held attempt; do not resend\./);
+  const u = await fixture(t);
+  await held(u, 'unverified');
+  assert.match(statusSummary(await u.steward.view(), { state: true }), /Blocker: held attempt output not verified\. Next: operator: check the held attempt; do not resend\./);
+});
+
+test('recovery takes priority over brief changes and paused admission in the summary', async t => {
+  const f = await fixture(t); const { reviewId } = await held(f, 'refused');
+  f.advance(Date.parse('2030-01-02T12:00:00.000Z') - Date.parse(f.now()));
+  let view = await f.steward.view();
+  assert.equal(view.contextFresh, false);
+  assert.equal(view.requests.find(r => r.id === reviewId).recovery.action, 'acknowledge');
+  assert.match(statusSummary(view), /Next: acknowledge the failed review/);
+  assert.doesNotMatch(statusSummary(view), /Next: update the project brief/);
+  await f.steward.pause();
+  view = await f.steward.view();
+  assert.match(statusSummary(view), /Next: acknowledge the failed review/);
+  assert.doesNotMatch(statusSummary(view), /then start a fresh request/);
+});
+
+test('summary does not offer a retry when the recovery handoff names the operator', async t => {
+  const f = await fixture(t); const { reviewId } = await held(f, 'rate_limited');
+  await f.store.change(s => { delete s.requests[reviewId].purpose; });
+  let view = await f.steward.view();
+  assert.ok(view.requests[0].retryReviewHash);
+  assert.match(statusSummary(view), /Next: .*retry/);
+  await f.store.change(s => { s.requests[reviewId].provider.rejection.retryAfter = { kind: 'seconds', seconds: 600 }; });
+  view = await f.steward.view();
+  assert.ok(view.requests[0].retryReviewHash);
+  assert.equal(view.requests[0].recovery.whoActs, 'Operator');
+  assert.match(statusSummary(view), /Next: operator:/);
+  assert.doesNotMatch(statusSummary(view), /Next: .*retry/);
 });
