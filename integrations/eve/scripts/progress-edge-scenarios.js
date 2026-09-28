@@ -67,7 +67,7 @@ export async function scenarioLostSubmission({ fixture, page, kit, login }) {
   await fixture.judge.waitUntilCalled({ atLeast: 3, timeoutMs: 20000 });
   await page.getByLabel('Request to Eve').fill('Synthetic: refused while another request runs.');
   await page.getByRole('button', { name: 'Ask Eve', exact: true }).click();
-  await page.getByText('A prior request needs review before another can run.', { exact: true }).waitFor({ timeout: 20000 });
+  await page.getByText('A prior request needs review before another can run.', { exact: true }).first().waitFor({ timeout: 20000 });
   if (await page.getByText('Submission outcome unknown', { exact: true }).count()) kit.fail('definite-refusal-shown-as-unknown', 'unknown marker remains');
   if (await page.evaluate(key => sessionStorage.getItem(key), PENDING_REQUEST_KEY)) kit.fail('definite-refusal-kept-receipt', 'receipt remains');
   fixture.judge.release(); await other;
