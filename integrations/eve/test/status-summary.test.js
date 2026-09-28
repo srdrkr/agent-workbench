@@ -174,7 +174,7 @@ test('paused with unresolved work recommends resolving it before resuming', asyn
   const record = await held.steward.propose(ask());
   assert.equal(record.status, 'held');
   await held.steward.pause();
-  assert.equal(parts(await held.summary()).Next, 'review the held attempt before resuming');
+  assert.equal(parts(await held.summary()).Next, 'operator: check the held attempt; do not resend');
   await assert.rejects(held.steward.resume(), /UNRESOLVED_MODEL_ATTEMPT/);
 
   const running = workspace();

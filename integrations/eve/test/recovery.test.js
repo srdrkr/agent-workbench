@@ -357,7 +357,7 @@ test('status summary and Telegram text follow the recovery case and the acknowle
   const { reviewId, record } = await held(f, 'refused');
   let view = await f.steward.view(); let text = statusSummary(view, { state: true });
   assert.equal(ownerState(view).key, 'blocked');
-  assert.match(text, /^State: Blocked\. .*Blocker: provider refused a held attempt\. Next: acknowledge the failed review in the web app, then start a fresh request\./);
+  assert.match(text, /^State: Blocked\. .*Blocker: provider refused a held attempt\. Next: acknowledge the failed review in the web app\./);
   assert.doesNotMatch(text, /needs review/);
   await f.steward.acknowledgeRejectedReview({ requestId: reviewId, acknowledgeHash: record.recovery.acknowledgeHash });
   view = await f.steward.view(); text = statusSummary(view, { state: true });
@@ -371,4 +371,32 @@ test('status summary and Telegram text follow the recovery case and the acknowle
   const u = await fixture(t);
   await held(u, 'unverified');
   assert.match(statusSummary(await u.steward.view(), { state: true }), /Blocker: held attempt output not verified\. Next: operator: check the held attempt; do not resend\./);
+});
+
+test('recovery takes priority over brief changes and paused admission in the summary', async t => {
+  const f = await fixture(t); const { reviewId } = await held(f, 'refused');
+  f.advance(Date.parse('2030-01-02T12:00:00.000Z') - Date.parse(f.now()));
+  let view = await f.steward.view();
+  assert.equal(view.contextFresh, false);
+  assert.equal(view.requests.find(r => r.id === reviewId).recovery.action, 'acknowledge');
+  assert.match(statusSummary(view), /Next: acknowledge the failed review/);
+  assert.doesNotMatch(statusSummary(view), /Next: update the project brief/);
+  await f.steward.pause();
+  view = await f.steward.view();
+  assert.match(statusSummary(view), /Next: acknowledge the failed review/);
+  assert.doesNotMatch(statusSummary(view), /then start a fresh request/);
+});
+
+test('summary does not offer a retry when the recovery handoff names the operator', async t => {
+  const f = await fixture(t); const { reviewId } = await held(f, 'rate_limited');
+  await f.store.change(s => { delete s.requests[reviewId].purpose; });
+  let view = await f.steward.view();
+  assert.ok(view.requests[0].retryReviewHash);
+  assert.match(statusSummary(view), /Next: .*retry/);
+  await f.store.change(s => { s.requests[reviewId].provider.rejection.retryAfter = { kind: 'seconds', seconds: 600 }; });
+  view = await f.steward.view();
+  assert.ok(view.requests[0].retryReviewHash);
+  assert.equal(view.requests[0].recovery.whoActs, 'Operator');
+  assert.match(statusSummary(view), /Next: operator:/);
+  assert.doesNotMatch(statusSummary(view), /Next: .*retry/);
 });

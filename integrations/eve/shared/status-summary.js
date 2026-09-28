@@ -54,8 +54,8 @@ const HELD_CASE = {
 function heldNext(held) {
   const r = held.recovery;
   if (!r) return 'review the held attempt';
-  if (r.action === 'acknowledge') return 'acknowledge the failed review in the web app, then start a fresh request';
-  if (held.retryReviewHash) return 'retry the refused request once in the web app';
+  if (r.action === 'acknowledge') return 'acknowledge the failed review in the web app';
+  if (held.retryReviewHash && r.canRetry) return 'use the offered one-time retry in the web app';
   if (r.case === 'uncertain_delivery') return 'operator: check provider usage for the held attempt; do not resend';
   if (/follow-through/i.test(r.whoActs ?? '')) return 'wait for follow-through to stop the task, then acknowledge';
   if (/operator/i.test(r.whoActs ?? '')) return 'operator: check the held attempt; do not resend';
@@ -156,7 +156,7 @@ function next(f) {
   const result = job?.result?.result;
   if (v.continuationProblem) return ['review continuation in the web app', '', 'blocked'];
   if (v.paused) {
-    if (held) return ['review the held attempt before resuming', '', 'blocked'];
+    if (held) return [heldNext(held), '', 'blocked'];
     if (stalled) return ['ask the operator to check the stalled request before resuming', '', 'blocked'];
     if (thinking) return ['wait for Eve before resuming', '', 'working'];
     if (jobOpen) return [ended ? 'close the coding run before resuming' : 'check Claude and close the run before resuming', '', 'blocked'];
@@ -164,11 +164,12 @@ function next(f) {
   }
   // A request in progress comes first: the brief cannot change and nothing else can be admitted until it ends.
   if (thinking) return ['wait for Eve\'s answer; no need to send the request again', '', 'working'];
-  if (v.contextFresh === false) return ['update the project brief', '', 'blocked'];
   if (stalled) return ['ask the operator to check the stalled request; do not resend it', '', 'blocked'];
   if (held) return [heldNext(held), '', 'blocked'];
+  if (v.contextFresh === false) return ['update the project brief', '', 'blocked'];
   // An acknowledged failed review of the stopped task: the PR is still unreviewed; nothing is retried.
-  if (f.acknowledged && v.followThrough?.status === 'blocked' && f.acknowledged.taskId === v.followThrough.taskId) {
+  if (f.acknowledged && !dollarsExhausted && !attemptsExhausted
+    && v.followThrough?.status === 'blocked' && f.acknowledged.taskId === v.followThrough.taskId) {
     return ['review the PR yourself or start a fresh request; the failed review stays in history', '', 'awaiting_decision'];
   }
   const follow = v.followThrough && followThroughNotice(v.followThrough);
