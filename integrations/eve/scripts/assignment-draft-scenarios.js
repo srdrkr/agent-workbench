@@ -116,7 +116,7 @@ export async function scenarioDraftEditApprove({ fixture, page, shot }) {
 export async function scenarioDraftGap({ fixture, page, shot }) {
   const r = recorder(); const watch = watchCoding(page);
   await askForDraft(page, fixture, GAP_REQUEST, DRAFT_GAP);
-  await page.getByText(DRAFT_GAP.question).waitFor({ timeout: 20000 });
+  await page.getByText(DRAFT_GAP.question, { exact: true }).waitFor({ timeout: 20000 });
   check(r, 'one-focused-question-shown', (DRAFT_GAP.question.match(/\?/g) ?? []).length === 1, DRAFT_GAP.question);
   check(r, 'needs-context-label', await page.getByText('Needs your context', { exact: true }).count() >= 1, 'Needs your context');
   const draftButtons = await page.getByRole('button', { name: 'Review Eve’s draft assignment' }).count();

@@ -21,7 +21,8 @@ export const codeReviewSchema = z.strictObject({
 
 // Opt-in assignment drafting (application mode `assignment_draft`). A separate schema
 // keeps ordinary requests, their byte-based reservations and the eval fixtures unchanged.
-// Sizes keep the whole output within the existing 2048-token cap. The server re-validates
+// Field limits bound the shape; the existing 2048-token cap can still truncate a
+// verbose response, which must pass the normal output validation. The server re-validates
 // every field against the approved context (hosted/assignment-draft.js); nothing here
 // grants scope or authority.
 export const assignmentDraftSchema = z.strictObject({
