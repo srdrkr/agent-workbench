@@ -79,7 +79,7 @@ test('unknown dispatch and unobserved sessions never read as Claude working', as
   w.state.coding = undefined; codingJob(w.state, { dispatch: 'accepted' });
   p = parts(await w.summary());
   assert.equal(p.Progress, 'sent to Claude, no GitHub result yet: Trim whitespace and collapse runs of spaces or hyphens in generated slugs');
-  assert.equal(p.Next, 'wait for GitHub progress; confirm when Claude finishes');
+  assert.equal(p.Next, 'check Claude, then confirm its current state');
   assert.doesNotMatch(await w.summary(), /working/i);
 
   w.state.coding = undefined; codingJob(w.state, { dispatch: 'accepted', execution: 'running' });
@@ -294,7 +294,7 @@ test('a request in progress reads as working everywhere and never asks for it ag
   assert.doesNotMatch(r.text, /done|executed|completed|committed/i);
   await w.steward.approve({ requestId: done.id, proposalHash: done.proposalHash });
   r = both(await w.steward.view());
-  assert.equal(r.key, 'completed'); assert.match(r.text, /^State: Decision recorded\. Progress: committed, not yet done: Review the blocker/);
+  assert.equal(r.key, 'decision_recorded'); assert.match(r.text, /^State: Decision recorded\. Progress: committed, not yet done: Review the blocker/);
   assert.equal(r.p.Next, 'work on: Review the blocker');
   await w.steward.completeCommitment({ commitmentId: done.id, expectedContextRevision: w.state.project.revision });
   r = both(await w.steward.view());
@@ -340,17 +340,35 @@ test('terminal request outcomes each point to their next action', async () => {
   assert.equal(both(plain).p.Next, 'review the held attempt');
 });
 
-test('the four owner states are distinct and stay within 280 characters with the link', async () => {
+test('all six owner states are distinct and stay within 280 characters with the link', async () => {
   const labels = new Set();
   const h = heldJudge(); const w = workspace({ judge: h.judge });
-  const running = w.steward.propose(ask()); await h.called;
   const views = [await w.steward.view()];
+  const running = w.steward.propose(ask()); await h.called;
+  views.push(await w.steward.view());
   h.release(); const done = await running; views.push(await w.steward.view());
   const held = workspace({ judge: async () => { throw new Error('synthetic'); } }); await held.steward.propose(ask()); views.push(await held.steward.view());
   await w.steward.approve({ requestId: done.id, proposalHash: done.proposalHash });
+  views.push(await w.steward.view());
   await w.steward.completeCommitment({ commitmentId: done.id, expectedContextRevision: w.state.project.revision }); views.push(await w.steward.view());
   const keys = views.map(v => ownerState(v).key);
-  assert.deepEqual(keys, ['working', 'awaiting_decision', 'blocked', 'completed']);
+  assert.deepEqual(keys, ['ready', 'working', 'awaiting_decision', 'blocked', 'decision_recorded', 'completed']);
   for (const v of views) { const text = statusSummary(v, { state: true, link: `${LINK}/${'p'.repeat(120)}` }); labels.add(stateOf(text)); assert.ok(text.length <= STATUS_SUMMARY_LIMIT); }
-  assert.equal(labels.size, 4);
+  assert.equal(labels.size, 6);
+});
+
+test('automatic reviews and unresolved prior-brief records retain truthful status', async () => {
+  const w = workspace();
+  const base = await w.steward.view();
+  const record = { id: 'review-test', status: 'thinking', purpose: 'coding_review', createdAt: base.observedAt,
+    contextRevision: 'previous-brief' };
+  let view = { ...base, requests: [record] };
+  assert.equal(ownerState(view).key, 'working');
+  assert.match(statusSummary(view, { state: true }), /Eve is reviewing the pull request/);
+  assert.doesNotMatch(statusSummary(view), /your request|Eve's answer/);
+  view.requests = [{ ...record, status: 'held', recovery: { case: 'uncertain_delivery', action: 'none', whoActs: 'Operator' } }];
+  assert.equal(ownerState(view).key, 'blocked'); assert.match(statusSummary(view), /operator: check provider usage/);
+  view.requests = [{ ...record, local: true, status: 'submission_unknown' }];
+  assert.equal(ownerState(view).key, 'blocked'); assert.match(statusSummary(view), /submission outcome unknown/);
+  assert.match(statusSummary(view), /do not create a new request/);
 });

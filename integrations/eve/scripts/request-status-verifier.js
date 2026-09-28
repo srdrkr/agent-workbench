@@ -14,6 +14,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawn, execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
 import { chromium } from 'playwright';
+import { scenarioLostSubmission, scenarioRecoveryStatusEdges } from './progress-edge-scenarios.js';
 import {
   startRequestStatusFixture,
   PROPOSAL_OK,
@@ -289,7 +290,7 @@ async function scenarioRejectedReviewRecovery({ fixture, page, shots }) {
   if (await page.getByRole('button', { name: 'Retry this request once' }).count()) fail('coding-review-must-not-offer-retry', 'retry shown');
   pass('no-proposal-retry-for-coding-review', true);
   const heldSummary = await page.locator('p.summary[data-owner-state="blocked"]').innerText().catch(() => '');
-  if (!/Next: acknowledge the failed review in the web app, then start a fresh request/.test(heldSummary)) fail('summary-disagrees-with-handoff', heldSummary);
+  if (!/Next: acknowledge the failed review in the web app\./.test(heldSummary)) fail('summary-disagrees-with-handoff', heldSummary);
   pass('summary-agrees-with-handoff', heldSummary);
   await shots.held();
   const ack = page.getByRole('button', { name: 'Acknowledge failed review' });
@@ -406,8 +407,8 @@ function agreement(s, key) {
     if (s.button !== 'Ask Eve') problems.push(`button ${s.button}`);
     if (!/your decision/i.test(s.cards[0]?.tag ?? '')) problems.push(`newest card is ${s.cards[0]?.tag}`);
   }
-  if (key === 'completed') {
-    if (!/^State: (Completed|Decision recorded)\./.test(s.summary) || !/Next: /.test(s.summary)) problems.push('summary not completed with a next step');
+  if (key === 'decision_recorded') {
+    if (!/^State: Decision recorded\./.test(s.summary) || !/Next: /.test(s.summary)) problems.push('summary lacks recorded decision and next step');
     if (!/committed/i.test(s.cards[0]?.tag ?? '')) problems.push(`newest card is ${s.cards[0]?.tag}`);
   }
   if (key === 'blocked') {
@@ -465,7 +466,7 @@ async function scenarioProgressWorking({ fixture, page, shots, timeline }) {
   await shots.awaiting();
   await page.getByRole('button', { name: 'Approve commitment' }).click();
   await page.getByText('Committed', { exact: true }).first().waitFor({ timeout: 20000 });
-  await expectAgreement(page, 'completed', 'after-approval', kit, timeline);
+  await expectAgreement(page, 'decision_recorded', 'after-approval', kit, timeline);
   if (!/Next: work on: Confirm the normalization priority/.test(await page.locator('p.summary').innerText())) kit.fail('completed-next-step', 'missing work on');
   await shots.completed();
   if (fixture.judge.calls !== 1) kit.fail('duplicate-admission', `judge calls ${fixture.judge.calls}`);
@@ -646,6 +647,10 @@ async function runOnce({ evidenceDir, netnsReported, netnsAvailable }) {
     awaiting: shot(page, '11-awaiting-decision.png'), completed: shot(page, '12-completed-next-step.png') } }) });
   await runScenario({ ...shared, name: 'progress-consistency-blocked', failureShot: '13-failure.png', body: ({ fixture, page, timeline }) => scenarioProgressBlocked({ fixture, page, timeline, shots: {
     blocked: shot(page, '13-blocked-next-step.png') } }) });
+  await runScenario({ ...shared, name: 'progress-lost-submission', failureShot: '14-failure.png',
+    body: args => scenarioLostSubmission({ ...args, kit: assertionKit(), login }) });
+  await runScenario({ ...shared, name: 'progress-recovery-status-edges', failureShot: '15-failure.png',
+    body: args => scenarioRecoveryStatusEdges({ ...args, kit: assertionKit(), login }) });
 
   const report = {
     generatedAt: phxNow(),

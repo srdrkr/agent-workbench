@@ -16,11 +16,10 @@ import { followThroughNotice } from './follow-through-notice.js';
  * progress), awaiting_decision, blocked, completed, or ready (nothing recorded).
  */
 export const STATUS_SUMMARY_LIMIT = 280;
-// A hosted request cannot outlive its function limit (90 s). A thinking record older
-// than this has stopped without recording an outcome; it is shown as stalled, never
-// as still working. Display only: the record itself is not changed.
+// Past the expected request window, an absent result means the outcome is unknown.
+// Display only: this neither changes the record nor proves the provider stopped.
 export const STALLED_AFTER_MS = 5 * 60_000;
-export const OWNER_STATES = Object.freeze({ working: 'In progress', awaiting_decision: 'Your decision needed', blocked: 'Blocked', completed: 'Completed', ready: 'Ready' });
+export const OWNER_STATES = Object.freeze({ working: 'In progress', awaiting_decision: 'Your decision needed', blocked: 'Blocked', decision_recorded: 'Decision recorded', completed: 'Completed', ready: 'Ready' });
 const MIN_DETAIL = 24;
 
 const clip = (text, max) => {
@@ -71,7 +70,8 @@ function facts(view, options = {}) {
   const v = view && typeof view === 'object' ? view : {};
   const nowMs = Date.parse(options.now ?? v.observedAt ?? '');
   const revision = v.project?.revision;
-  const current = list(v.requests).filter(r => !r.contextRevision || revision === undefined || r.contextRevision === revision);
+  const requests = list(v.requests);
+  const current = requests.filter(r => !r.contextRevision || revision === undefined || r.contextRevision === revision);
   // The progress view is already scoped to the active project by the application,
   // so an empty list there is authoritative. Only a view without it falls back to
   // the unscoped lists, and then only to records of the same project.
@@ -84,15 +84,17 @@ function facts(view, options = {}) {
   // execution: owner-observed session state ('unobserved', 'running', 'exited', 'stopped').
   const dispatch = job?.dispatch; const execution = job?.execution;
   const failedStart = ['rejected', 'usage_limited'].includes(dispatch);
-  const held = current.find(r => r.status === 'held') ?? null;
-  const pending = current.find(r => r.status === 'thinking') ?? null;
+  // Admission is blocked by unresolved records even from an older brief.
+  const held = requests.find(r => r.status === 'held') ?? null;
+  const pending = requests.find(r => r.status === 'thinking') ?? null;
+  const unknownSubmission = requests.find(r => r.local && r.status === 'submission_unknown') ?? null;
   // A local (not yet refreshed) submission is never stalled; a recorded one is judged by server time.
   const stalled = pending && requestStalled(pending, Number.isFinite(nowMs) ? new Date(nowMs).toISOString() : undefined) ? pending : null;
   const thinking = stalled ? null : pending;
   const newest = latest(current, 'createdAt');
   const jobOpen = Boolean(job && !job.releasedAt && !failedStart);
   return {
-    v, job, held, thinking, stalled, jobOpen, failedStart,
+    v, job, held, thinking, stalled, unknownSubmission, jobOpen, failedStart,
     needsContext: newest?.status === 'needs_context' ? newest : null,
     notSent: newest?.status === 'not_sent' ? newest : null,
     acknowledged: newest?.status === 'rejection_acknowledged' ? newest : null,
@@ -132,7 +134,8 @@ function progress({ job, jobOpen, failedStart, startUnconfirmed, running, ended,
   return ['no recorded progress yet', ''];
 }
 
-function blocker({ v, held, thinking, stalled, job, jobOpen, failedStart, startUnconfirmed, notSent, dollarsExhausted, attemptsExhausted }) {
+function blocker({ v, held, thinking, stalled, unknownSubmission, job, jobOpen, failedStart, startUnconfirmed, notSent, dollarsExhausted, attemptsExhausted }) {
+  if (unknownSubmission) return ['submission outcome unknown; request ID saved', ''];
   if (v.continuationProblem) return [CONTINUATION[v.continuationProblem] ?? 'continuation needs operator review', ''];
   if (v.paused) return ['new model requests paused', ''];
   if (v.contextFresh === false) return ['project brief expired', ''];
@@ -144,7 +147,7 @@ function blocker({ v, held, thinking, stalled, job, jobOpen, failedStart, startU
   if (failedStart && !job.releasedAt) return [job.dispatch === 'usage_limited' ? 'Claude usage limit; coding did not start' : 'coding dispatch rejected', ''];
   if (jobOpen && job.stopRequested) return ['coding paused; stop requested, not confirmed', ''];
   if (v.monitor?.lastError) return ['GitHub check unavailable; older result shown', ''];
-  if (thinking) return ['none; Eve is working on your request', ''];
+  if (thinking) return [thinking.purpose === 'coding_review' ? 'none; Eve is reviewing the pull request' : 'none; Eve is working on your request', ''];
   if (job?.result?.result === 'conflicting_prs') return ['several PRs match one task', ''];
   if (notSent) return ['the last request was not sent', ''];
   return ['none recorded', ''];
@@ -152,18 +155,19 @@ function blocker({ v, held, thinking, stalled, job, jobOpen, failedStart, startU
 
 // Returns [fixed text, detail, owner state]. The state comes from the same branch as the text.
 function next(f) {
-  const { v, held, thinking, stalled, job, jobOpen, failedStart, startUnconfirmed, running, ended, awaiting, needsContext, notSent, open, done, priority, dollarsExhausted, attemptsExhausted } = f;
+  const { v, held, thinking, stalled, unknownSubmission, job, jobOpen, failedStart, startUnconfirmed, running, ended, awaiting, needsContext, notSent, open, done, priority, dollarsExhausted, attemptsExhausted } = f;
   const result = job?.result?.result;
+  if (unknownSubmission) return ['check the saved submission in Decisions; do not create a new request', '', 'blocked'];
   if (v.continuationProblem) return ['review continuation in the web app', '', 'blocked'];
   if (v.paused) {
     if (held) return [heldNext(held), '', 'blocked'];
     if (stalled) return ['ask the operator to check the stalled request before resuming', '', 'blocked'];
-    if (thinking) return ['wait for Eve before resuming', '', 'working'];
+    if (thinking) return [thinking.purpose === 'coding_review' ? 'wait for the PR review before resuming' : 'wait for Eve before resuming', '', 'working'];
     if (jobOpen) return [ended ? 'close the coding run before resuming' : 'check Claude and close the run before resuming', '', 'blocked'];
     return ['resume requests when ready', '', 'blocked'];
   }
   // A request in progress comes first: the brief cannot change and nothing else can be admitted until it ends.
-  if (thinking) return ['wait for Eve\'s answer; no need to send the request again', '', 'working'];
+  if (thinking) return [thinking.purpose === 'coding_review' ? 'wait for the PR review; do not start another review' : 'wait for Eve\'s answer; no need to send the request again', '', 'working'];
   if (stalled) return ['ask the operator to check the stalled request; do not resend it', '', 'blocked'];
   if (held) return [heldNext(held), '', 'blocked'];
   if (v.contextFresh === false) return ['update the project brief', '', 'blocked'];
@@ -181,7 +185,7 @@ function next(f) {
     if (result === 'tested_draft_pr') return ['confirm Claude finished, then review the draft PR', '', 'awaiting_decision'];
     if (result === 'merged_pr') return ['confirm Claude finished and close the run', '', 'awaiting_decision'];
     if (result === 'needs_review' || result === 'conflicting_prs') return ['review the PR state, then confirm Claude finished', '', 'awaiting_decision'];
-    return ['wait for GitHub progress; confirm when Claude finishes', '', 'working'];
+    return ['check Claude, then confirm its current state', '', 'awaiting_decision'];
   }
   if (job && !failedStart && UNMERGED.includes(result)) {
     return [result === 'branch_without_pr' ? 'check the pushed branch; no PR yet' : result === 'conflicting_prs' ? 'resolve the several matching PRs' : 'review the unmerged PR', '', 'awaiting_decision'];
@@ -194,7 +198,7 @@ function next(f) {
   if (notSent) return ['check the allowance and brief size, then ask again', '', 'blocked'];
   if (f.acknowledged) return ['start a fresh request; the failed review stays in history', '', 'ready'];
   if (v.continuationAvailable) return ['review the next Eve request', '', 'awaiting_decision'];
-  if (open) return ['work on: ', open.title, 'completed', 'Decision recorded'];
+  if (open) return ['work on: ', open.title, 'decision_recorded'];
   const finished = done || (job && job.releasedAt && result === 'merged_pr') ? 'completed' : 'ready';
   if (priority) return ['priority: ', priority.text, finished];
   return ['ask Eve for the next useful step', '', finished];
