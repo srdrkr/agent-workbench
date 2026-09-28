@@ -1,6 +1,7 @@
 import { PENDING_REQUEST_KEY } from '../app/utils/pending-request.js';
 
 export async function scenarioLostSubmission({ fixture, page, kit, login }) {
+  fixture.judge.release();
   await login(page, fixture);
   let statusAvailable = true; let mode = 'lost-response'; const sent = [];
   await page.route('**/api/steward/state', route => statusAvailable ? route.fallback()
@@ -39,7 +40,7 @@ export async function scenarioLostSubmission({ fixture, page, kit, login }) {
   await page.reload({ waitUntil: 'domcontentloaded' });
   await page.getByRole('button', { name: 'Retry saved request', exact: true }).waitFor({ timeout: 20000 });
   await page.getByRole('button', { name: 'Retry saved request', exact: true }).click();
-  await page.getByText('Submission outcome unknown', { exact: true }).waitFor({ state: 'detached', timeout: 20000 });
+  await page.waitForFunction(() => [...document.querySelectorAll('article.decision h3')].filter(el => el.textContent === 'Confirm the normalization priority').length === 2, null, { timeout: 20000 });
   await page.getByRole('button', { name: 'Refresh status', exact: true }).click();
   if (sent.length !== 3 || sent[1].requestId !== sent[2].requestId || sent[1].message !== sent[2].message) kit.fail('saved-retry-changed-request', JSON.stringify(sent.map(s => s.requestId)));
   if (fixture.judge.calls !== 2) kit.fail('saved-retry-call-count', String(fixture.judge.calls));
