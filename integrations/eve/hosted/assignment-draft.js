@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { outcomePreserved } from '../shared/assignment-outcome.js';
 /**
  * Validation and composition for Eve's optional assignment draft.
  *
@@ -69,7 +70,7 @@ export function composeAssignment(draft, project) {
  * @param {{ project: object, request: string, proposal: object }} input approved snapshot,
  *   verbatim owner request, and the already-validated plan proposal
  */
-export function validateAssignmentDraft(draft, { project, request, proposal }) {
+export function validateAssignmentDraft(draft, { project, approvedProject = project, request, proposal }) {
   if (!draftShapeOk(draft)) throw new Error('INVALID_ASSIGNMENT_DRAFT');
   const flags = [];
   const sourceRefs = [];
@@ -87,15 +88,17 @@ export function validateAssignmentDraft(draft, { project, request, proposal }) {
   for (const file of draft.files) {
     if (!pathSyntaxOk(file.path)) { flags.push({ field: 'files', value: clip(file.path), reason: 'invalid_path', why: file.why }); continue; }
     if (files.some(f => f.path === file.path)) continue;
-    const evidence = pathEvidence(file.path, project);
+    const evidence = pathEvidence(file.path, approvedProject);
     if (!evidence) { flags.push({ field: 'files', value: file.path, reason: 'not_in_approved_context', why: file.why }); continue; }
     files.push({ path: file.path, why: file.why, evidence });
   }
   const result = { version: 1, outcome: request, contextRevision: project.revision, sourceRefs, files,
     acceptanceExamples: [...draft.acceptanceExamples], verification: [...draft.verification], flags, gap: null };
-  result.composed = composeAssignment(result, project);
+  const composed = composeAssignment(result, project);
   if (!files.length) result.gap = SCOPE_GAP_QUESTION;
-  else if (result.composed.objective.length > DRAFT_LIMITS.specText || result.composed.acceptance.length > DRAFT_LIMITS.specText) result.gap = CONTEXT_GAP_QUESTION;
+  else if (composed.objective.length > DRAFT_LIMITS.specText || composed.acceptance.length > DRAFT_LIMITS.specText) result.gap = CONTEXT_GAP_QUESTION;
+  // Keep the gap explicit rather than prefill an unusable or silently shortened task.
+  result.composed = result.gap ? null : composed;
   result.draftHash = hash(result);
   return result;
 }
@@ -107,5 +110,5 @@ export function assignmentProvenance({ objective, acceptance, allowedPaths }, pr
   if (!draft) return { unverifiedPaths };
   const submitted = { objective, acceptance, allowedPaths: [...allowedPaths].sort() };
   return { unverifiedPaths, fromDraft: draft.draftHash, editedByOwner: hash(submitted) !== hash(draft.composed),
-    outcomeIntact: objective.includes(draft.outcome) };
+    outcomeIntact: outcomePreserved(objective, draft.outcome) };
 }

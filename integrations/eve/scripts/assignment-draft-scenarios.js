@@ -92,6 +92,11 @@ export async function scenarioDraftEditApprove({ fixture, page, shot }) {
   const firstReview = { requestId: firstRecord.id, proposalHash: firstRecord.proposalHash, reviewHash: firstRecord.codingReview.reviewHash };
   await page.getByRole('button', { name: 'Edit assignment' }).click();
   await page.locator('[data-editing-prepared]').waitFor({ timeout: 10000 });
+  await page.locator('#assignment').getByRole('button', { name: 'Cancel', exact: true }).click();
+  await page.getByRole('heading', { name: 'Approve one coding assignment' }).waitFor({ timeout: 10000 });
+  check(r, 'cancel-edit-retains-original-review', (await state(page)).requests.find(x => x.id === firstReview.requestId)?.codingReview?.reviewHash === firstReview.reviewHash, 'same review');
+  await page.getByRole('button', { name: 'Edit assignment' }).click();
+  await page.locator('[data-editing-prepared]').waitFor({ timeout: 10000 });
   const finalAcceptance = `${firstEdit}\n4. Confirm "Ünïcode  Title" keeps its letters`;
   await field(page, ACCEPTANCE).fill(finalAcceptance);
   await prepare(page);

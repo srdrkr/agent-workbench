@@ -102,15 +102,19 @@ export class HostedSteward {
         // The optional assignment draft is validated separately; the proposal (and its
         // hash) keeps the existing strict shape. Semantic draft problems are flagged,
         // not fatal; a malformed draft invalidates the output like any malformed field.
-        const { draft = null, ...core } = proposal;
+        const { draft = null, ...withoutDraft } = proposal;
+        let core = record.mode === 'assignment_draft' ? withoutDraft : proposal;
         validateProposal(core, record.contextSnapshot);
-        if (draft !== null && record.mode !== 'assignment_draft') record.draftIgnored = 'not_requested';
-        else if (draft !== null && core.kind === 'plan') {
-          record.assignmentDraft = validateAssignmentDraft(draft, { project: record.contextSnapshot, request: record.message, proposal: core });
+        if (draft !== null && core.kind === 'plan') {
+          const checked = validateAssignmentDraft(draft, { project: record.contextSnapshot, approvedProject: state.project, request: record.message, proposal: core });
+          if (checked.gap) {
+            record.draftFeedback = { gap: checked.gap, flags: checked.flags };
+            core = { ...core, kind: 'clarify', candidateId: null, question: checked.gap };
+          } else record.assignmentDraft = checked;
         } else if (draft !== null) record.draftIgnored = 'not_a_plan';
         record.proposal = core;
         record.proposalHash = digest({ projectId, contextRevision: record.contextRevision, proposal: core });
-        record.status = proposal.kind === 'clarify' ? 'needs_context' : 'awaiting_approval';
+        record.status = core.kind === 'clarify' ? 'needs_context' : 'awaiting_approval';
       } catch {
         record.status = record.provider?.intentAt ? 'held' : 'not_sent';
         record.failure = record.provider?.intentAt ? 'judgment_unavailable_or_invalid' : 'provider_not_admitted';

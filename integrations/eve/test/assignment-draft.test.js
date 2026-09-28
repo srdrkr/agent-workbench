@@ -7,6 +7,7 @@ import { HostedCoding } from '../hosted/coding.js';
 import { proposalSchema, draftProposalSchema } from '../schema.js';
 import { savePendingRequest, loadPendingRequest } from '../app/utils/pending-request.js';
 import { statusSummary } from '../shared/status-summary.js';
+import { outcomePreserved } from '../shared/assignment-outcome.js';
 import { validateAssignmentDraft, draftShapeOk, pathEvidence, pathSyntaxOk, SCOPE_GAP_QUESTION, composeAssignment } from '../hosted/assignment-draft.js';
 import { ASSIGNMENT_PROJECT, DRAFT_CODING_SPEC, DRAFT_CLOCK_START, draftRepositoryReader, SUFFICIENT_REQUEST, GAP_REQUEST, UNSCOPED_REQUEST,
   DRAFT_OK, DRAFT_WITH_INVALID, DRAFT_NO_SCOPE, DRAFT_GAP } from './assignment-draft-fixture.js';
@@ -83,8 +84,16 @@ test('draft shape is bounded and strict; the schema stays compatible with draft-
 test('composition does not truncate context: oversized context becomes a question instead', () => {
   const big = { ...project, sources: project.sources.map(s => ({ ...s, content: `${s.content} ${'x'.repeat(1500)} src/slug.js` })) };
   const d = validateAssignmentDraft(DRAFT_OK.draft, { project: big, request: SUFFICIENT_REQUEST, proposal: core(DRAFT_OK) });
-  assert.ok(d.composed.objective.length > 4000); assert.match(d.gap, /^Which referenced context/);
-  assert.equal(composeAssignment(d, big).objective, d.composed.objective);
+  assert.equal(d.composed, null); assert.match(d.gap, /^Which referenced context/);
+  assert.ok(composeAssignment(d, big).objective.length > 4000);
+});
+
+test('an outcome mentioned only inside copied context is not preserved at the start', () => {
+  const outcome = 'Add CSV export';
+  assert.equal(outcomePreserved(outcome, outcome), true);
+  assert.equal(outcomePreserved(`${outcome}\nApproved context: ${outcome}`, outcome), true);
+  assert.equal(outcomePreserved(`Do something else.\nApproved context: ${outcome}`, outcome), false);
+  assert.equal(outcomePreserved(`${outcome} and change billing`, outcome), false);
 });
 
 async function world(t, response = DRAFT_OK, start = DRAFT_CLOCK_START) {
@@ -132,6 +141,35 @@ test('missing context produces one focused question and no draft', async t => {
   assert.equal(record.status, 'needs_context'); assert.equal(record.proposal.question, DRAFT_GAP.question);
   assert.equal(record.assignmentDraft, undefined); assert.equal(w.calls.sends.length, 0);
   await assert.rejects(w.coding.prepare({ requestId: 'from-gap', fromRequestId: 'gap-one', objective: GAP_REQUEST, acceptance: 'x', allowedPaths: ['src/slug.js'], expectedContextRevision: w.revision }), /APPROVAL_MISMATCH/);
+});
+
+test('overlong composition asks for narrower context; a refreshed brief can produce a usable draft', async t => {
+  const w = await world(t);
+  const large = { ...structuredClone(ASSIGNMENT_PROJECT), sources: ASSIGNMENT_PROJECT.sources.map(s => ({ ...s, content: `${s.content} ${'x'.repeat(1500)}` })) };
+  let preview = await w.steward.previewContext(large);
+  await w.steward.applyContext({ previewId: preview.id, expectedRevision: preview.expectedRevision });
+  let revision = (await w.store.read()).project.revision;
+  const blocked = await w.steward.propose({ requestId: 'large-one', projectId: ASSIGNMENT_PROJECT.id, message: SUFFICIENT_REQUEST, mode: 'assignment_draft', expectedContextRevision: revision });
+  assert.equal(blocked.status, 'needs_context'); assert.equal(blocked.assignmentDraft, undefined);
+  assert.match(blocked.proposal.question, /^Which referenced context/);
+  await assert.rejects(w.coding.prepare({ requestId: 'large-assignment', fromRequestId: blocked.id, objective: 'x', acceptance: 'x', allowedPaths: ['src/slug.js'], expectedContextRevision: revision }), /APPROVAL_MISMATCH/);
+  preview = await w.steward.previewContext(structuredClone(ASSIGNMENT_PROJECT));
+  await w.steward.applyContext({ previewId: preview.id, expectedRevision: preview.expectedRevision });
+  revision = (await w.store.read()).project.revision;
+  const resolved = await w.steward.propose({ requestId: 'small-one', projectId: ASSIGNMENT_PROJECT.id, message: SUFFICIENT_REQUEST, mode: 'assignment_draft', expectedContextRevision: revision });
+  const review = await w.coding.prepare({ requestId: 'small-assignment', fromRequestId: resolved.id, ...resolved.assignmentDraft.composed, expectedContextRevision: revision });
+  assert.equal(review.requestId, 'small-assignment'); assert.equal(w.calls.sends.length, 0);
+});
+
+test('a file mentioned only in derived project progress is not approved brief scope', async t => {
+  const response = { ...DRAFT_OK, draft: { ...DRAFT_OK.draft, files: [{ path: 'src/notes-only.js', why: 'mentioned in a note' }] } };
+  const w = await world(t, response);
+  await w.steward.saveNote({ text: 'Consider src/notes-only.js', kind: 'note', expectedContextRevision: w.revision });
+  const r = await w.steward.propose({ requestId: 'notes-scope', projectId: ASSIGNMENT_PROJECT.id, message: SUFFICIENT_REQUEST, mode: 'assignment_draft', expectedContextRevision: w.revision });
+  assert.ok(w.calls.lastInput.project.sources.find(s => s.id === 'project-progress').content.includes('src/notes-only.js'));
+  assert.equal(r.status, 'needs_context'); assert.equal(r.assignmentDraft, undefined);
+  assert.deepEqual(r.draftFeedback.flags.map(f => [f.value, f.reason]), [['src/notes-only.js', 'not_in_approved_context']]);
+  assert.equal(w.calls.sends.length, 0);
 });
 
 test('a draft on a non-plan is ignored and a malformed draft is held like any invalid output', async t => {
@@ -235,7 +273,7 @@ test('draft mode is opt-in: ordinary requests keep their schema and identity; un
   assert.equal(proposalSchema.safeParse(DRAFT_OK).success, false, 'ordinary schema is unchanged and rejects a draft');
   const w = await world(t);
   const plain = await w.steward.propose({ requestId: 'plain-one', projectId: ASSIGNMENT_PROJECT.id, message: SUFFICIENT_REQUEST, expectedContextRevision: w.revision });
-  assert.equal(plain.draftIgnored, 'not_requested'); assert.equal(plain.assignmentDraft, undefined); assert.equal(plain.mode, undefined);
+  assert.equal(plain.status, 'held'); assert.equal(plain.assignmentDraft, undefined); assert.equal(plain.mode, undefined);
   assert.equal(plain.inputHash, digest({ projectId: ASSIGNMENT_PROJECT.id, message: SUFFICIENT_REQUEST }));
   assert.equal(Object.hasOwn(w.calls.inputs.at(-1), 'mode'), false);
   await assert.rejects(w.steward.propose({ requestId: 'plain-one', projectId: ASSIGNMENT_PROJECT.id, message: SUFFICIENT_REQUEST, mode: 'assignment_draft', expectedContextRevision: w.revision }), /REQUEST_ID_CONFLICT/);
