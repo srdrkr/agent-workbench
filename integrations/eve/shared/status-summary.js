@@ -10,8 +10,16 @@ import { followThroughNotice } from './follow-through-notice.js';
  * as more certain than the record supports: a draft PR is not a merge, a merge
  * is not a deployment, a GitHub result never proves the Claude session ended,
  * and "working" is only said when the owner recorded the session as running.
+ *
+ * Owner state: every Next branch also names one state, so the state and the next
+ * step can never disagree: working (a recorded request or observed session is in
+ * progress), awaiting_decision, blocked, decision_recorded, completed, or ready.
  */
 export const STATUS_SUMMARY_LIMIT = 280;
+// Past the expected request window, an absent result means the outcome is unknown.
+// Display only: this neither changes the record nor proves the provider stopped.
+export const STALLED_AFTER_MS = 5 * 60_000;
+export const OWNER_STATES = Object.freeze({ working: 'In progress', awaiting_decision: 'Your decision needed', blocked: 'Blocked', decision_recorded: 'Decision recorded', completed: 'Completed', ready: 'Ready' });
 const MIN_DETAIL = 24;
 
 const clip = (text, max) => {
@@ -32,16 +40,38 @@ const GITHUB = {
   not_found: 'no GitHub result recorded yet',
 };
 const UNMERGED = ['tested_draft_pr', 'needs_review', 'branch_without_pr', 'conflicting_prs'];
+// Outcome-1 follow-up: a held record may carry the server's recovery classification
+// (hosted/recovery.js). Only its case, action and who-acts fields are used here.
+const HELD_CASE = {
+  confirmed_rejection: 'provider refused a held attempt',
+  expired_authority: 'provider refused a held attempt; its authority expired',
+  allowance_exhausted: 'provider refused a held attempt; allowance exhausted',
+  uncertain_delivery: 'held attempt outcome unknown',
+  unverified_output: 'held attempt output not verified',
+  unclassified: 'held attempt cannot be classified safely',
+};
+function heldNext(held) {
+  const r = held.recovery;
+  if (!r) return 'review the held attempt';
+  if (r.action === 'acknowledge') return 'acknowledge the failed review in the web app';
+  if (held.retryReviewHash && r.canRetry) return 'use the offered one-time retry in the web app';
+  if (r.case === 'uncertain_delivery') return 'operator: check provider usage for the held attempt; do not resend';
+  if (/follow-through/i.test(r.whoActs ?? '')) return 'wait for follow-through to stop the task, then acknowledge';
+  if (/operator/i.test(r.whoActs ?? '')) return 'operator: check the held attempt; do not resend';
+  return 'review the held attempt';
+}
 const CONTINUATION = {
   CONTINUATION_CONTEXT_CHANGED: 'brief changed after the follow-up was approved',
   CONTINUATION_SOURCE_EXPIRED: 'reviewed coding result expired',
   CONTINUATION_UNAVAILABLE: 'coding run must close before continuing',
 };
 
-function facts(view) {
+function facts(view, options = {}) {
   const v = view && typeof view === 'object' ? view : {};
+  const nowMs = Date.parse(options.now ?? v.observedAt ?? '');
   const revision = v.project?.revision;
-  const current = list(v.requests).filter(r => !r.contextRevision || revision === undefined || r.contextRevision === revision);
+  const requests = list(v.requests);
+  const current = requests.filter(r => !r.contextRevision || revision === undefined || r.contextRevision === revision);
   // The progress view is already scoped to the active project by the application,
   // so an empty list there is authoritative. Only a view without it falls back to
   // the unscoped lists, and then only to records of the same project.
@@ -54,11 +84,20 @@ function facts(view) {
   // execution: owner-observed session state ('unobserved', 'running', 'exited', 'stopped').
   const dispatch = job?.dispatch; const execution = job?.execution;
   const failedStart = ['rejected', 'usage_limited'].includes(dispatch);
-  const held = current.find(r => r.status === 'held') ?? null;
-  const thinking = current.find(r => r.status === 'thinking') ?? null;
+  // Admission is blocked by unresolved records even from an older brief.
+  const held = requests.find(r => r.status === 'held') ?? null;
+  const pending = requests.find(r => r.status === 'thinking') ?? null;
+  const unknownSubmission = requests.find(r => r.local && r.status === 'submission_unknown') ?? null;
+  // A local (not yet refreshed) submission is never stalled; a recorded one is judged by server time.
+  const stalled = pending && requestStalled(pending, Number.isFinite(nowMs) ? new Date(nowMs).toISOString() : undefined) ? pending : null;
+  const thinking = stalled ? null : pending;
+  const newest = latest(current, 'createdAt');
   const jobOpen = Boolean(job && !job.releasedAt && !failedStart);
   return {
-    v, job, held, thinking, jobOpen, failedStart,
+    v, job, held, thinking, stalled, unknownSubmission, jobOpen, failedStart,
+    needsContext: newest?.status === 'needs_context' ? newest : null,
+    notSent: newest?.status === 'not_sent' ? newest : null,
+    acknowledged: newest?.status === 'rejection_acknowledged' ? newest : null,
     startUnconfirmed: jobOpen && dispatch !== 'accepted' && !['running', 'exited', 'stopped'].includes(execution),
     running: jobOpen && execution === 'running',
     ended: jobOpen && ['exited', 'stopped'].includes(execution),
@@ -95,71 +134,103 @@ function progress({ job, jobOpen, failedStart, startUnconfirmed, running, ended,
   return ['no recorded progress yet', ''];
 }
 
-function blocker({ v, held, thinking, job, jobOpen, failedStart, startUnconfirmed, dollarsExhausted, attemptsExhausted }) {
+function blocker({ v, held, thinking, stalled, unknownSubmission, job, jobOpen, failedStart, startUnconfirmed, notSent, dollarsExhausted, attemptsExhausted }) {
+  if (unknownSubmission) return ['submission outcome unknown; request ID saved', ''];
   if (v.continuationProblem) return [CONTINUATION[v.continuationProblem] ?? 'continuation needs operator review', ''];
   if (v.paused) return ['new model requests paused', ''];
   if (v.contextFresh === false) return ['project brief expired', ''];
   if (dollarsExhausted) return [`model allowance used up (${usd(v.reservedMicros)} of ${usd(v.budgetMicros)} reserved)`, ''];
   if (attemptsExhausted) return [`request limit reached (${v.providerAttempts} of ${v.maxProviderAttempts} attempts)`, ''];
-  if (held) return ['a held model attempt needs review', ''];
+  if (stalled) return ['no result recorded from Eve; outcome unknown', ''];
+  if (held) return [HELD_CASE[held.recovery?.case] ?? 'a held model attempt needs review', ''];
   if (startUnconfirmed) return ['coding start unconfirmed; check Claude first', ''];
   if (failedStart && !job.releasedAt) return [job.dispatch === 'usage_limited' ? 'Claude usage limit; coding did not start' : 'coding dispatch rejected', ''];
   if (jobOpen && job.stopRequested) return ['coding paused; stop requested, not confirmed', ''];
   if (v.monitor?.lastError) return ['GitHub check unavailable; older result shown', ''];
-  if (thinking) return ['waiting for Eve', ''];
+  if (thinking) return [thinking.purpose === 'coding_review' ? 'none; Eve is reviewing the pull request' : 'none; Eve is working on your request', ''];
   if (job?.result?.result === 'conflicting_prs') return ['several PRs match one task', ''];
+  if (notSent) return ['the last request was not sent', ''];
   return ['none recorded', ''];
 }
 
+// Returns [fixed text, detail, owner state]. The state comes from the same branch as the text.
 function next(f) {
-  const { v, held, thinking, job, jobOpen, failedStart, startUnconfirmed, running, ended, awaiting, open, priority, dollarsExhausted, attemptsExhausted } = f;
+  const { v, held, thinking, stalled, unknownSubmission, job, jobOpen, failedStart, startUnconfirmed, running, ended, awaiting, needsContext, notSent, open, done, priority, dollarsExhausted, attemptsExhausted } = f;
   const result = job?.result?.result;
-  if (v.continuationProblem) return ['review continuation in the web app', ''];
+  if (unknownSubmission) return ['check the saved submission in Decisions; do not create a new request', '', 'blocked'];
+  if (v.continuationProblem) return ['review continuation in the web app', '', 'blocked'];
   if (v.paused) {
-    if (held) return ['review the held attempt before resuming', ''];
-    if (thinking) return ['wait for Eve before resuming', ''];
-    if (jobOpen) return [ended ? 'close the coding run before resuming' : 'check Claude and close the run before resuming', ''];
-    return ['resume requests when ready', ''];
+    if (held) return [heldNext(held), '', 'blocked'];
+    if (stalled) return ['ask the operator to check the stalled request before resuming', '', 'blocked'];
+    if (thinking) return [thinking.purpose === 'coding_review' ? 'wait for the PR review before resuming' : 'wait for Eve before resuming', '', 'working'];
+    if (jobOpen) return [ended ? 'close the coding run before resuming' : 'check Claude and close the run before resuming', '', 'blocked'];
+    return ['resume requests when ready', '', 'blocked'];
   }
-  if (v.contextFresh === false) return ['update the project brief', ''];
-  if (held) return ['review the held attempt', ''];
-  if (thinking) return ['wait for Eve, then review the proposal', ''];
+  // A request in progress comes first: the brief cannot change and nothing else can be admitted until it ends.
+  if (thinking) return [thinking.purpose === 'coding_review' ? 'wait for the PR review; do not start another review' : 'wait for Eve\'s answer; no need to send the request again', '', 'working'];
+  if (stalled) return ['ask the operator to check the stalled request; do not resend it', '', 'blocked'];
+  if (held) return [heldNext(held), '', 'blocked'];
+  if (v.contextFresh === false) return ['update the project brief', '', 'blocked'];
+  // An acknowledged failed review of the stopped task: the PR is still unreviewed; nothing is retried.
+  if (f.acknowledged && !dollarsExhausted && !attemptsExhausted
+    && v.followThrough?.status === 'blocked' && f.acknowledged.taskId === v.followThrough.taskId) {
+    return ['review the PR yourself or start a fresh request; the failed review stays in history', '', 'awaiting_decision'];
+  }
   const follow = v.followThrough && followThroughNotice(v.followThrough);
-  if (follow) return ['', follow];
+  if (follow) return ['', follow, ['blocked', 'waiting_for_connection'].includes(v.followThrough.status) ? 'blocked' : 'awaiting_decision'];
   if (jobOpen) {
-    if (startUnconfirmed) return ['check Claude, then confirm or close the run', ''];
-    if (ended) return [result === 'tested_draft_pr' ? 'close the coding run, then review the draft PR' : 'check GitHub, then close the coding run', ''];
-    if (running) return ['wait for Claude; check GitHub later', ''];
-    if (result === 'tested_draft_pr') return ['confirm Claude finished, then review the draft PR', ''];
-    if (result === 'merged_pr') return ['confirm Claude finished and close the run', ''];
-    if (result === 'needs_review' || result === 'conflicting_prs') return ['review the PR state, then confirm Claude finished', ''];
-    return ['wait for GitHub progress; confirm when Claude finishes', ''];
+    if (startUnconfirmed) return ['check Claude, then confirm or close the run', '', 'blocked'];
+    if (ended) return [result === 'tested_draft_pr' ? 'close the coding run, then review the draft PR' : 'check GitHub, then close the coding run', '', 'awaiting_decision'];
+    if (running) return ['wait for Claude; check GitHub later', '', 'working'];
+    if (result === 'tested_draft_pr') return ['confirm Claude finished, then review the draft PR', '', 'awaiting_decision'];
+    if (result === 'merged_pr') return ['confirm Claude finished and close the run', '', 'awaiting_decision'];
+    if (result === 'needs_review' || result === 'conflicting_prs') return ['review the PR state, then confirm Claude finished', '', 'awaiting_decision'];
+    return ['check Claude, then confirm its current state', '', 'awaiting_decision'];
   }
   if (job && !failedStart && UNMERGED.includes(result)) {
-    return [result === 'branch_without_pr' ? 'check the pushed branch; no PR yet' : result === 'conflicting_prs' ? 'resolve the several matching PRs' : 'review the unmerged PR', ''];
+    return [result === 'branch_without_pr' ? 'check the pushed branch; no PR yet' : result === 'conflicting_prs' ? 'resolve the several matching PRs' : 'review the unmerged PR', '', 'awaiting_decision'];
   }
-  if (failedStart && !job.releasedAt) return ['review the failed coding start in the web app', ''];
-  if (dollarsExhausted) return ['review the pilot allowance; no automatic top-up', ''];
-  if (attemptsExhausted) return ['review the pilot allowance', ''];
-  if (awaiting) return [awaiting.proposal.kind === 'coding' ? 'review the coding assignment: ' : 'decide on the proposal: ', awaiting.proposal.title];
-  if (v.continuationAvailable) return ['review the next Eve request', ''];
-  if (open) return ['work on: ', open.title];
-  if (priority) return ['priority: ', priority.text];
-  return ['ask Eve for the next useful step', ''];
+  if (failedStart && !job.releasedAt) return ['review the failed coding start in the web app', '', 'blocked'];
+  if (dollarsExhausted) return ['review the pilot allowance; no automatic top-up', '', 'blocked'];
+  if (attemptsExhausted) return ['review the pilot allowance', '', 'blocked'];
+  if (awaiting?.assignmentDraft?.gap) return ['answer the draft scope question: ', awaiting.assignmentDraft.gap, 'awaiting_decision'];
+  if (awaiting) return [awaiting.assignmentDraft ? 'review the draft assignment: ' : awaiting.proposal.kind === 'coding' ? 'review the coding assignment: ' : 'decide on the proposal: ', awaiting.proposal.title, 'awaiting_decision'];
+  if (needsContext) return ['answer Eve\'s question in a new request: ', needsContext.proposal?.question ?? needsContext.proposal?.title ?? '', 'awaiting_decision'];
+  if (notSent) return ['check the allowance and brief size, then ask again', '', 'blocked'];
+  if (f.acknowledged) return ['start a fresh request; the failed review stays in history', '', 'ready'];
+  if (v.continuationAvailable) return ['review the next Eve request', '', 'awaiting_decision'];
+  if (open) return ['work on: ', open.title, 'decision_recorded'];
+  const finished = done || (job && job.releasedAt && result === 'merged_pr') ? 'completed' : 'ready';
+  if (priority) return ['priority: ', priority.text, finished];
+  return ['ask Eve for the next useful step', '', finished];
+}
+
+/** True when a recorded thinking request is older than the hosted limit allows (display only). */
+export function requestStalled(record, observedAt) {
+  const nowMs = Date.parse(observedAt ?? '');
+  return Boolean(record?.status === 'thinking' && !record.local && Number.isFinite(nowMs) && nowMs - Date.parse(record.createdAt) > STALLED_AFTER_MS);
+}
+
+/** One of OWNER_STATES' keys plus its label, derived from the same branch as the Next text. */
+export function ownerState(view, { now } = {}) {
+  const [, , key, label] = next(facts(view, { now }));
+  return { key, label: label ?? OWNER_STATES[key] };
 }
 
 /**
  * @param {object} view steward view / web state
- * @param {{ link?: string }} [options] optional link appended after the text
+ * @param {{ link?: string, state?: boolean, now?: string }} [options] optional link appended after the text;
+ *   state prefixes the owner state; now overrides the view's server time (view.observedAt)
  * @returns {string} at most 280 characters including the link
  */
-export function statusSummary(view, { link = '' } = {}) {
-  const f = facts(view);
-  const parts = [['Progress: ', ...progress(f)], ['Blocker: ', ...blocker(f)], ['Next: ', ...next(f)]];
+export function statusSummary(view, { link = '', state = false, now } = {}) {
+  const f = facts(view, { now });
+  const [nextFixed, nextDetail, key, label] = next(f);
+  const parts = [...(state ? [['State: ', label ?? OWNER_STATES[key], '']] : []), ['Progress: ', ...progress(f)], ['Blocker: ', ...blocker(f)], ['Next: ', nextFixed, nextDetail]];
   const suffix = typeof link === 'string' && link.trim() ? `\n${link.trim()}` : '';
   const budget = STATUS_SUMMARY_LIMIT - suffix.length;
   const render = limits => parts.map(([label, fixed, detail], i) => `${label}${fixed}${detail ? clip(detail, limits[i]).replace(/\.$/, '') : ''}.`).join(' ');
-  const limits = [80, 80, 80];
+  const limits = parts.map(() => 80);
   let text = render(limits);
   for (let i = 0; text.length > budget && i < parts.length; i++) {
     const excess = text.length - budget;

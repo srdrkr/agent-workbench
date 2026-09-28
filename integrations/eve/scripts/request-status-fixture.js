@@ -5,8 +5,12 @@
  * and routes /api/* to the REAL hostedHandler (ownerAuth + HostedSteward + HostedStore
  * on PGlite TestPool). Only the judge/provider boundary is stubbed.
  *
+ * Held-review scenarios seed one synthetic, already-closed coding task and then run
+ * the real FollowThrough -> createCodeReview -> hostedTransport path once, with a
+ * fake provider send (see test/held-review-fixture.js).
+ *
  * Exclusions (explicit): production Nitro/Vercel function assembly, live AI Gateway,
- * live Postgres, Telegram, coding dispatch, follow-through.
+ * live Postgres, Telegram, coding dispatch, live GitHub reads.
  */
 import { createServer } from 'node:http';
 import { randomBytes } from 'node:crypto';
@@ -26,6 +30,7 @@ import { ownerAuth } from '../hosted/auth.js';
 import { hostedHandler } from '../hosted/http.js';
 import { setupHosted } from '../hosted/setup.js';
 import { HostedCoding } from '../hosted/coding.js';
+import { seedSyntheticTask, runSyntheticReview } from '../test/held-review-fixture.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const eveRoot = resolve(here, '..');
@@ -382,6 +387,7 @@ export async function startRequestStatusFixture({
   const auth = ownerAuth(pool, { origin, secret });
   handler = hostedHandler({ auth, steward, ownerEmail, origin });
 
+  const reviewCounters = { judge: 0, send: 0 };
   const credentials = { email: ownerEmail, password, secret };
   // credentials stay in-process only; callers must not write them into shared artifacts
 
@@ -400,6 +406,17 @@ export async function startRequestStatusFixture({
     codingSends,
     now,
     advanceClock(ms) { clockAdvance += ms; return now(); },
+    /** Approves a pilot, seeds one synthetic closed task and runs one real review with a fake provider outcome. */
+    async prepareHeldReview(outcome) {
+      const now = () => new Date().toISOString();
+      const review = await steward.reviewPilot({ budgetMicros, maxProviderAttempts: 50 });
+      await steward.approvePilot({ reviewHash: review.reviewHash });
+      await seedSyntheticTask(store, now);
+      const { reviewId } = await runSyntheticReview({ store, now, outcome, counters: reviewCounters });
+      return { reviewId };
+    },
+    /** Every model/provider path the fixture can reach, for no-call assertions. */
+    modelCalls() { return { proposeJudge: judgeControl.calls, reviewJudge: reviewCounters.judge, reviewProviderSend: reviewCounters.send }; },
     blockedNode,
     blockedBrowser,
     networkCoverage() {
@@ -417,25 +434,9 @@ export async function startRequestStatusFixture({
           'live Postgres',
           'Telegram',
           codingOptions ? 'live coding dispatch (Routine fire replaced by an in-process recorder; GitHub reads by a static synthetic reader)' : 'coding dispatch',
-          'follow-through',
+          'live GitHub reads (synthetic reader)',
         ],
       };
-    },
-    browserRouteHandler: async (route) => {
-      const req = route.request();
-      const url = new URL(req.url());
-      if (url.protocol === 'data:' || url.protocol === 'blob:') {
-        await route.continue();
-        return;
-      }
-      if (url.origin === origin) {
-        await route.continue();
-        return;
-      }
-      const entry = { at: new Date().toISOString(), source: 'browser', url: url.href, method: req.method() };
-      blockedBrowser.push(entry);
-      await route.abort('blockedbyclient');
-      throw new Error(`BROWSER_NETWORK_DENIED:${url.href}`);
     },
     async close() {
       await new Promise(resolveClose => server.close(resolveClose));

@@ -5,12 +5,28 @@ import { HostedStore, stateSchema } from '../hosted/store.js';
 import { HostedSteward, initialState, digest } from '../hosted/steward.js';
 import { HostedCoding } from '../hosted/coding.js';
 import { proposalSchema, draftProposalSchema } from '../schema.js';
+import { savePendingRequest, loadPendingRequest } from '../app/utils/pending-request.js';
+import { statusSummary } from '../shared/status-summary.js';
 import { validateAssignmentDraft, draftShapeOk, pathEvidence, pathSyntaxOk, SCOPE_GAP_QUESTION, composeAssignment } from '../hosted/assignment-draft.js';
 import { ASSIGNMENT_PROJECT, DRAFT_CODING_SPEC, DRAFT_CLOCK_START, draftRepositoryReader, SUFFICIENT_REQUEST, GAP_REQUEST, UNSCOPED_REQUEST,
   DRAFT_OK, DRAFT_WITH_INVALID, DRAFT_NO_SCOPE, DRAFT_GAP } from './assignment-draft-fixture.js';
 
 const project = { ...structuredClone(ASSIGNMENT_PROJECT), revision: 'rev-draft-test' };
 const core = p => { const { draft, ...rest } = p; return rest; };
+
+test('an uncertain draft retains its exact request mode across a page reload', () => {
+  let saved;
+  const storage = { setItem: (_, value) => { saved = value; }, getItem: () => saved, removeItem: () => { saved = null; } };
+  const request = { id: 'saved-draft', projectId: 'synthetic', message: 'Keep my original scope.', expectedContextRevision: 'a'.repeat(64), createdAt: '2026-09-27T12:00:00Z' };
+  for (const mode of [undefined, 'assignment_draft']) {
+    savePendingRequest(storage, { ...request, ...(mode ? { mode } : {}) });
+    const restored = loadPendingRequest(storage, request.projectId);
+    assert.equal(restored.mode, mode); assert.equal(restored.id, request.id); assert.equal(restored.message, request.message);
+    assert.equal(restored.unknown, true); assert.equal(restored.reconciled, false);
+  }
+  savePendingRequest(storage, { ...request, mode: 'coding_review' });
+  assert.equal(loadPendingRequest(storage, request.projectId), null);
+});
 
 test('a sufficient draft keeps the owner outcome verbatim and only context-named files', () => {
   const d = validateAssignmentDraft(DRAFT_OK.draft, { project, request: SUFFICIENT_REQUEST, proposal: core(DRAFT_OK) });
@@ -107,6 +123,7 @@ test('one judge call yields a reviewable draft without reconfirming the settled 
   assert.deepEqual(state.commitments, {}); assert.deepEqual(codingEvents(state), []); assert.equal(w.calls.sends.length, 0);
   const view = await w.steward.view();
   assert.equal(view.requests[0].assignmentDraft.draftHash, record.assignmentDraft.draftHash);
+  assert.match(statusSummary(view), /Next: review the draft assignment:/);
 });
 
 test('missing context produces one focused question and no draft', async t => {

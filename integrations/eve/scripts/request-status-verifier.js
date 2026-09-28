@@ -7,13 +7,14 @@
  * running under a network namespace.
  */
 import { mkdtemp, mkdir, writeFile, rm, readFile, access } from 'node:fs/promises';
-import { createWriteStream, existsSync } from 'node:fs';
+import { createWriteStream, existsSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawn, execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
 import { chromium } from 'playwright';
+import { scenarioLostSubmission, scenarioRecoveryStatusEdges } from './progress-edge-scenarios.js';
 import {
   startRequestStatusFixture,
   PROPOSAL_OK,
@@ -60,12 +61,8 @@ async function gitSha(cwd) {
 }
 
 async function ensureSpaBuild() {
-  try {
-    await resolveClientAssets(eveRoot);
-    return { built: false, reason: 'existing-generate-public' };
-  } catch {
-    // fall through
-  }
+  // A previous branch can leave valid but stale assets. Only --skip-build may
+  // reuse them; normal runs must exercise the current working tree's UI.
   const node = process.execPath;
   const env = {
     HOME: process.env.HOME,
@@ -110,6 +107,38 @@ async function withFixture(evidenceDir, fn, fixtureOptions = {}) {
     }
   }
   return { result, cleanup };
+}
+
+/**
+ * The single final write of report.json. Runs the leak check against a
+ * scrubbed candidate BEFORE writing anything, so the persisted file always
+ * reflects the leak result (ok:false + scrubFailure when a leak is found),
+ * never an earlier "ok:true" snapshot taken before the check ran. Callers
+ * must not write report.json again after this returns, or the leak check
+ * stops covering what's actually left on disk.
+ */
+export async function scrubAndWriteReport(evidenceDir, report, secrets) {
+  const candidateText = scrubArtifactText(JSON.stringify(report, null, 2), secrets);
+  const leakCheck = { checkedAt: phxNow(), leaks: [] };
+  for (const secret of secrets) {
+    if (!secret) continue;
+    const files = [];
+    // Belt-and-suspenders: catch a secret that survives scrubArtifactText in
+    // the report's own text, in addition to greping the rest of the
+    // evidence directory for stray unscrubbed artifacts (e.g. a leftover
+    // log). Neither check writes anything yet.
+    if (candidateText.includes(secret)) files.push('report.json');
+    const { stdout } = await execFile('bash', ['-lc', `grep -R --fixed-strings -l -- ${JSON.stringify(secret)} ${JSON.stringify(evidenceDir)} 2>/dev/null || true`]);
+    if (stdout.trim()) files.push(...stdout.trim().split('\n'));
+    if (files.length) leakCheck.leaks.push({ hint: secret.slice(0, 4) + '…', files });
+  }
+  const finalReport = leakCheck.leaks.length
+    ? { ...report, ok: false, scrubFailure: leakCheck }
+    : report;
+  const finalText = scrubArtifactText(JSON.stringify(finalReport, null, 2), secrets);
+  await writeFile(join(evidenceDir, 'report.json'), finalText);
+  await writeFile(join(evidenceDir, 'scrub-check.json'), JSON.stringify(leakCheck, null, 2));
+  return finalReport;
 }
 
 async function installBrowserRoute(context, fixture, scenarioFailures) {
@@ -231,7 +260,281 @@ async function scenarioBlocked({ fixture, page, shots }) {
   return assertions;
 }
 
-async function runOnce({ evidenceDir, netnsReported }) {
+function assertionKit() {
+  const assertions = [];
+  const fail = (name, observed) => { assertions.push({ name, ok: false, observed }); throw new Error(name + ': ' + observed); };
+  const pass = (name, observed) => assertions.push({ name, ok: true, observed });
+  return { assertions, fail, pass };
+}
+const sameCalls = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+
+async function expectHandoff(page, kind, { fail, pass }) {
+  const handoff = page.locator(`[data-recovery-case="${kind}"]`);
+  try { await handoff.waitFor({ timeout: 20000 }); } catch { fail('missing-recovery-handoff', `Expected a handoff for case ${kind}`); }
+  const text = await handoff.innerText();
+  for (const label of ['What happened', 'Still unknown', 'Who needs to act', 'Next step']) {
+    if (!text.includes(label)) fail('handoff-field-missing', label);
+  }
+  pass(`handoff-${kind}-visible`, text.replace(/\s+/g, ' ').slice(0, 600));
+  return { handoff, text };
+}
+
+async function scenarioRejectedReviewRecovery({ fixture, page, shots }) {
+  const kit = assertionKit(); const { fail, pass } = kit;
+  const { reviewId } = await fixture.prepareHeldReview('refused');
+  await login(page, fixture);
+  await page.getByText('Needs operator review').first().waitFor({ timeout: 20000 });
+  const { text } = await expectHandoff(page, 'confirmed_rejection', kit);
+  if (!/refused/.test(text) || !/You \(the owner\)/.test(text)) fail('handoff-content', text.slice(0, 300));
+  if (!(await page.getByLabel('Request to Eve').isDisabled())) fail('ask-must-be-blocked-while-held', 'enabled');
+  pass('ask-blocked-while-held', true);
+  if (await page.getByRole('button', { name: 'Retry this request once' }).count()) fail('coding-review-must-not-offer-retry', 'retry shown');
+  pass('no-proposal-retry-for-coding-review', true);
+  const heldSummary = await page.locator('p.summary[data-owner-state="blocked"]').innerText().catch(() => '');
+  if (!/Next: acknowledge the failed review in the web app\./.test(heldSummary)) fail('summary-disagrees-with-handoff', heldSummary);
+  pass('summary-agrees-with-handoff', heldSummary);
+  await shots.held();
+  const ack = page.getByRole('button', { name: 'Acknowledge failed review' });
+  try { await ack.waitFor({ timeout: 10000 }); } catch { fail('missing-acknowledge-control', 'Acknowledge failed review button absent'); }
+  await shots.available(ack);
+  pass('acknowledge-available', true);
+
+  const stateBefore = await fixture.store.read(); const callsBefore = fixture.modelCalls();
+  await ack.click();
+  try { await page.getByText('Failed review acknowledged · history kept').waitFor({ timeout: 20000 }); }
+  catch { fail('acknowledgement-not-shown', 'Expected label "Failed review acknowledged · history kept" after acknowledging'); }
+  const callsAfter = fixture.modelCalls();
+  if (!sameCalls(callsBefore, callsAfter)) fail('acknowledge-sent-model-request', JSON.stringify({ callsBefore, callsAfter }));
+  pass('acknowledge-no-model-or-routine-request', callsAfter);
+  const stateAfter = await fixture.store.read(); const record = stateAfter.requests[reviewId];
+  if (record.status !== 'rejection_acknowledged') fail('acknowledgement-not-persisted', record.status);
+  if (JSON.stringify(record.provider) !== JSON.stringify(stateBefore.requests[reviewId].provider) || stateAfter.reservedMicros !== stateBefore.reservedMicros
+    || JSON.stringify(stateAfter.coding) !== JSON.stringify(stateBefore.coding)) fail('records-or-accounting-changed', 'provider/reservation/task changed');
+  pass('records-and-accounting-retained', { reservedMicros: stateAfter.reservedMicros, retained: record.provider.reservedMicros });
+
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  try { await page.getByText('Failed review acknowledged · history kept').waitFor({ timeout: 20000 }); }
+  catch { fail('acknowledgement-not-persisted', 'label missing after reload'); }
+  if (await page.getByRole('button', { name: 'Acknowledge failed review' }).count()) fail('acknowledge-still-offered', 'after reload');
+  pass('acknowledgement-persisted-after-reload', true);
+  const readySummary = await page.locator('p.summary[data-owner-state="awaiting_decision"]').innerText().catch(() => '');
+  if (!/Next: review the PR yourself or start a fresh request; the failed review stays in history/.test(readySummary)) fail('summary-disagrees-after-acknowledge', readySummary);
+  pass('summary-agrees-after-acknowledge', readySummary);
+  const fresh = page.getByRole('button', { name: 'Start a fresh request' });
+  try { await fresh.waitFor({ timeout: 10000 }); } catch { fail('missing-next-step', 'Start a fresh request button absent'); }
+  await fresh.click();
+  await page.waitForFunction(() => document.activeElement?.id === 'request', null, { timeout: 5000 }).catch(() => fail('next-step-not-reachable', 'request field not focused'));
+  if (await page.getByLabel('Request to Eve').isDisabled()) fail('next-step-not-reachable', 'request field disabled');
+  pass('next-step-fresh-request-reachable', true);
+  await shots.after();
+
+  fixture.judge.hold();
+  await page.getByLabel('Request to Eve').fill('After the failed review, what is the next useful step?');
+  const called = fixture.judge.waitUntilCalled({ timeoutMs: 20000 });
+  await page.getByRole('button', { name: 'Ask Eve' }).click();
+  await called;
+  fixture.judge.release(PROPOSAL_OK);
+  await page.getByRole('heading', { name: 'Confirm the normalization priority' }).waitFor({ timeout: 20000 });
+  await page.getByRole('button', { name: 'Approve commitment' }).waitFor({ timeout: 10000 });
+  const finalState = await fixture.store.read();
+  const freshIds = Object.keys(finalState.requests).filter(id => id !== reviewId);
+  if (freshIds.length !== 1 || finalState.requests[freshIds[0]].status !== 'awaiting_approval') fail('fresh-request-not-created', JSON.stringify(freshIds));
+  const finalCalls = fixture.modelCalls();
+  if (finalCalls.reviewJudge !== callsBefore.reviewJudge || finalCalls.reviewProviderSend !== callsBefore.reviewProviderSend) fail('review-was-retried', JSON.stringify(finalCalls));
+  pass('fresh-request-awaits-fresh-approval', { newRequestId: freshIds[0] !== reviewId, calls: finalCalls });
+  return kit.assertions;
+}
+
+async function scenarioUncertainReviewBlocked({ fixture, page, shots }) {
+  const kit = assertionKit(); const { fail, pass } = kit;
+  const { reviewId } = await fixture.prepareHeldReview('lost');
+  await login(page, fixture);
+  await page.getByText('Needs operator review').first().waitFor({ timeout: 20000 });
+  const { text } = await expectHandoff(page, 'uncertain_delivery', kit);
+  if (!text.includes('Missing evidence or capability') || !/session reconciliation/.test(text) || !/Keep this held/.test(text)) fail('uncertain-handoff-content', text.slice(0, 400));
+  pass('uncertain-handoff-names-missing-capability', true);
+  if (await page.getByRole('button', { name: 'Acknowledge failed review' }).count()) fail('uncertain-must-not-offer-acknowledge', 'shown');
+  if (await page.getByRole('button', { name: 'Retry this request once' }).count()) fail('uncertain-must-not-offer-retry', 'shown');
+  if (!(await page.getByLabel('Request to Eve').isDisabled())) fail('uncertain-must-block-new-requests', 'ask enabled');
+  pass('uncertain-offers-no-recovery-and-blocks-requests', true);
+  const uncertainSummary = await page.locator('p.summary[data-owner-state="blocked"]').innerText().catch(() => '');
+  if (!/Next: operator: check provider usage for the held attempt; do not resend/.test(uncertainSummary)) fail('summary-disagrees-with-uncertain-handoff', uncertainSummary);
+  pass('summary-agrees-with-uncertain-handoff', uncertainSummary);
+  await shots.uncertain();
+  const callsBefore = fixture.modelCalls();
+  const direct = await page.evaluate(async id => {
+    const r = await fetch('/api/steward/recovery/acknowledge', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ requestId: id, acknowledgeHash: 'a'.repeat(64) }) });
+    return { status: r.status, body: await r.json() };
+  }, reviewId);
+  if (direct.status !== 409 || direct.body.error !== 'RECOVERY_NOT_SUPPORTED') fail('uncertain-direct-acknowledge-not-rejected', JSON.stringify(direct));
+  const record = (await fixture.store.read()).requests[reviewId];
+  if (record.status !== 'held') fail('uncertain-record-changed', record.status);
+  if (!sameCalls(callsBefore, fixture.modelCalls())) fail('uncertain-sent-model-request', JSON.stringify(fixture.modelCalls()));
+  pass('uncertain-direct-acknowledge-rejected', direct);
+  return kit.assertions;
+}
+
+// Reads every status surface at once, so each checkpoint is one consistent observation.
+async function surfaces(page) {
+  return page.evaluate(() => {
+    const text = el => (el ? el.innerText.replace(/\s+/g, ' ').trim() : null);
+    const summary = document.querySelector('p.summary');
+    const ask = document.querySelector('section.ask');
+    return {
+      ownerState: summary?.dataset.ownerState ?? null, summary: text(summary),
+      button: text(ask?.querySelector('button')), buttonDisabled: Boolean(ask?.querySelector('button')?.disabled),
+      requestDisabled: Boolean(document.getElementById('request')?.disabled),
+      askNotice: text(ask?.querySelector('p.notice')),
+      cards: [...document.querySelectorAll('article.decision')].map(a => ({ tag: text(a.querySelector('.tag')), body: text(a) })),
+    };
+  });
+}
+
+// Invariants per owner state: every surface must tell the same story.
+function agreement(s, key) {
+  const problems = [];
+  if (s.ownerState !== key) problems.push(`summary state ${s.ownerState} != ${key}`);
+  const all = [s.summary, s.button, s.askNotice, ...s.cards.map(c => c.body)].filter(Boolean).join(' | ');
+  if (key === 'working') {
+    if (!/^State: In progress\./.test(s.summary)) problems.push('summary does not say In progress');
+    if (/ask Eve for the next useful step|ask again|send it again\b(?! is)|submit a new request/i.test(all.replace(/you do not need to send it again|no need to send the request again/gi, ''))) problems.push('a surface invites resending');
+    if (!['Working…', 'Eve is working…'].includes(s.button) || !s.buttonDisabled || !s.requestDisabled) problems.push(`ask panel not working: ${s.button}`);
+    if (!/you do not need to send it again/.test(s.askNotice ?? '')) problems.push('ask notice does not say the request is in progress');
+    if (s.cards[0]?.tag !== 'WAITING FOR EVE' && s.cards[0]?.tag !== 'Waiting for Eve') problems.push(`newest card is ${s.cards[0]?.tag}`);
+  }
+  if (key === 'awaiting_decision') {
+    if (!/^State: Your decision needed\./.test(s.summary) || !/Next: decide on the proposal/.test(s.summary)) problems.push('summary does not ask for a decision');
+    if (/\b(done|executed|completed)\b/i.test(s.summary)) problems.push('proposal described as executed');
+    if (s.button !== 'Ask Eve') problems.push(`button ${s.button}`);
+    if (!/your decision/i.test(s.cards[0]?.tag ?? '')) problems.push(`newest card is ${s.cards[0]?.tag}`);
+  }
+  if (key === 'decision_recorded') {
+    if (!/^State: Decision recorded\./.test(s.summary) || !/Next: /.test(s.summary)) problems.push('summary lacks recorded decision and next step');
+    if (!/committed/i.test(s.cards[0]?.tag ?? '')) problems.push(`newest card is ${s.cards[0]?.tag}`);
+  }
+  if (key === 'blocked') {
+    if (!/^State: Blocked\./.test(s.summary) || !/Next: (review the held attempt|operator: |acknowledge the failed review)/.test(s.summary)) problems.push('summary not blocked with next step');
+    if (!/needs review/.test(s.askNotice ?? '')) problems.push('ask notice does not name the held attempt');
+    if (!/needs operator review/i.test(s.cards[0]?.tag ?? '')) problems.push(`newest card is ${s.cards[0]?.tag}`);
+  }
+  return problems;
+}
+
+async function expectAgreement(page, key, name, kit, timeline) {
+  // Wait on the DOM (no sleeps) until the summary reports the state, then check every surface.
+  await page.locator(`p.summary[data-owner-state="${key}"]`).waitFor({ timeout: 20000 }).catch(() => {});
+  const s = await surfaces(page);
+  timeline.push({ checkpoint: name, at: new Date().toISOString(), ...s });
+  const problems = agreement(s, key);
+  if (problems.length) kit.fail(`surfaces-disagree:${name}`, `${problems.join('; ')} :: summary="${s.summary}" button="${s.button}"`);
+  kit.pass(`surfaces-agree:${name}`, { summary: s.summary, button: s.button, askNotice: s.askNotice, newestCard: s.cards[0]?.tag });
+}
+
+async function scenarioProgressWorking({ fixture, page, shots, timeline }) {
+  const kit = assertionKit();
+  await login(page, fixture);
+  await page.locator('p.summary[data-owner-state="ready"]').waitFor({ timeout: 20000 });
+  kit.pass('initial-ready', await page.locator('p.summary').innerText());
+  fixture.judge.hold();
+  await page.getByLabel('Request to Eve').fill('What is the next useful step for link normalization?');
+  const called = fixture.judge.waitUntilCalled({ timeoutMs: 20000 });
+  await page.getByRole('button', { name: 'Ask Eve' }).click();
+  await called;
+  // No poll has run yet: the first observation must already agree.
+  const immediate = await surfaces(page);
+  timeline.push({ checkpoint: 'immediately-after-submit', at: new Date().toISOString(), ...immediate });
+  const early = agreement(immediate, 'working');
+  if (early.length) kit.fail('surfaces-disagree:immediately-after-submit', `${early.join('; ')} :: summary="${immediate.summary}" button="${immediate.button}"`);
+  kit.pass('surfaces-agree:immediately-after-submit', { summary: immediate.summary, button: immediate.button });
+  await shots.working();
+  // Manual refresh is available while the request runs and returns the durable record.
+  const refresh = page.getByRole('button', { name: 'Refresh status' });
+  if (await refresh.isDisabled()) kit.fail('refresh-disabled-while-working', 'Refresh status disabled');
+  await refresh.click();
+  await page.getByText('Eve is working on this request.').first().waitFor({ timeout: 20000 });
+  await expectAgreement(page, 'working', 'after-manual-refresh', kit, timeline);
+  // Reload mid-judge restores the durable working state.
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await page.getByText('YOUR WORKSPACE').waitFor({ timeout: 20000 });
+  await expectAgreement(page, 'working', 'after-reload-mid-judge', kit, timeline);
+  if ((await page.getByRole('button', { name: 'Eve is working…' }).count()) !== 1) kit.fail('reload-button-not-working', 'no Eve is working… button');
+  await shots.reload();
+  if (fixture.judge.calls !== 1) kit.fail('duplicate-admission', `judge calls ${fixture.judge.calls}`);
+  kit.pass('single-admission-after-reload', fixture.judge.calls);
+  fixture.judge.release(PROPOSAL_OK);
+  await page.getByRole('heading', { name: 'Confirm the normalization priority' }).waitFor({ timeout: 20000 });
+  await expectAgreement(page, 'awaiting_decision', 'after-release', kit, timeline);
+  await shots.awaiting();
+  await page.getByRole('button', { name: 'Approve commitment' }).click();
+  await page.getByText('Committed', { exact: true }).first().waitFor({ timeout: 20000 });
+  await expectAgreement(page, 'decision_recorded', 'after-approval', kit, timeline);
+  if (!/Next: work on: Confirm the normalization priority/.test(await page.locator('p.summary').innerText())) kit.fail('completed-next-step', 'missing work on');
+  await shots.completed();
+  if (fixture.judge.calls !== 1) kit.fail('duplicate-admission', `judge calls ${fixture.judge.calls}`);
+  return kit.assertions;
+}
+
+async function scenarioProgressBlocked({ fixture, page, shots, timeline }) {
+  const kit = assertionKit();
+  await login(page, fixture);
+  fixture.judge.hold();
+  await page.getByLabel('Request to Eve').fill('Please advise on the next step.');
+  const called = fixture.judge.waitUntilCalled({ timeoutMs: 20000 });
+  await page.getByRole('button', { name: 'Ask Eve' }).click();
+  await called;
+  await expectAgreement(page, 'working', 'blocked-scenario-working', kit, timeline);
+  fixture.judge.releaseHeld();
+  await page.getByText('Needs operator review').first().waitFor({ timeout: 20000 });
+  await expectAgreement(page, 'blocked', 'after-held', kit, timeline);
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await page.getByText('YOUR WORKSPACE').waitFor({ timeout: 20000 });
+  await expectAgreement(page, 'blocked', 'held-after-reload', kit, timeline);
+  await shots.blocked();
+  return kit.assertions;
+}
+
+async function runScenario({ name, evidenceDir, secrets, scenarios, scenarioFailures, cleanupResults, failureShot, body }) {
+  const { cleanup } = await withFixture(evidenceDir, async ({ fixture, browser }) => {
+    secrets.push(fixture.getOwnerLogin().email, fixture.getOwnerLogin().password, fixture._credentials.secret);
+    const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+    const routeFailures = [];
+    await installBrowserRoute(context, fixture, routeFailures);
+    const page = await context.newPage();
+    const sc = { name, startedAt: phxNow(), ok: false, assertions: [], timeline: [], error: null, durationMs: 0 };
+    const t0 = Date.now();
+    try {
+      sc.assertions = await body({ fixture, page, timeline: sc.timeline });
+      if (routeFailures.length) throw new Error(`network-boundary:${routeFailures.join(';')}`);
+      if (fixture.blockedBrowser.length || fixture.blockedNode.length) throw new Error(`blocked-network:${JSON.stringify([...fixture.blockedBrowser, ...fixture.blockedNode])}`);
+      sc.ok = sc.assertions.every(a => a.ok);
+    } catch (e) {
+      sc.error = String(e.message || e); sc.ok = false;
+      try { await page.screenshot({ path: join(evidenceDir, failureShot), fullPage: true }); } catch { /* ignore */ }
+    } finally {
+      sc.durationMs = Date.now() - t0; sc.finishedAt = phxNow();
+      sc.modelCalls = fixture.modelCalls(); sc.judgeCalls = fixture.judge.calls;
+      scenarios.push(sc);
+      await context.close();
+    }
+    if (!sc.ok) scenarioFailures.push(sc.error || sc.name);
+  });
+  cleanupResults.push({ scenario: name, ...cleanup });
+}
+
+/**
+ * Builds the bash script run inside `unshare -rn` for --netns. Exported so
+ * the exit-code-forwarding property below can be tested with plain `bash`,
+ * without needing a real network namespace: the loud loopback failure exits
+ * immediately (unaffected by the rest of the script), and otherwise the
+ * script's own exit code must equal innerCommand's, not `echo`'s (which is
+ * always 0) — that mismatch was the bug that let a failing child mask
+ * itself as success.
+ */
+export function buildNetnsWrapperScript(innerCommand) {
+  return `if ! ip link set lo up 2>/dev/null; then echo '--netns: could not bring up loopback (ip missing or failed)' >&2; exit 1; fi; ${innerCommand}; ec=$?; echo "EXIT:$ec"; exit $ec`;
+}
+
+async function runOnce({ evidenceDir, netnsReported, netnsAvailable }) {
   const started = Date.now();
   const headSha = await gitSha(repoRoot);
   const baseSha = '342070c0e3c2e09205f4c8df38b3eb7f63644772';
@@ -328,6 +631,28 @@ async function runOnce({ evidenceDir, netnsReported }) {
     cleanupResults.push({ scenario: 'blocked-request', ...cleanup });
   }
 
+  // Scenarios 3 and 4 — held coding reviews, each on a fresh fixture
+  const shared = { evidenceDir, secrets, scenarios, scenarioFailures, cleanupResults };
+  await runScenario({ ...shared, name: 'held-rejected-review-recovery', failureShot: '05-failure.png', body: ({ fixture, page }) => scenarioRejectedReviewRecovery({ fixture, page, shots: {
+    held: () => page.screenshot({ path: join(evidenceDir, '05-held-with-handoff.png'), fullPage: true }),
+    available: ack => page.locator('article', { has: ack }).screenshot({ path: join(evidenceDir, '06-recovery-available.png') }),
+    after: () => page.screenshot({ path: join(evidenceDir, '07-after-recovery-next-step.png'), fullPage: true }),
+  } }) });
+  await runScenario({ ...shared, name: 'held-uncertain-review-blocked', failureShot: '08-failure.png', body: ({ fixture, page }) => scenarioUncertainReviewBlocked({ fixture, page, shots: {
+    uncertain: () => page.screenshot({ path: join(evidenceDir, '08-uncertain-still-blocked.png'), fullPage: true }),
+  } }) });
+
+  const shot = (page, file) => () => page.screenshot({ path: join(evidenceDir, file), fullPage: true });
+  await runScenario({ ...shared, name: 'progress-consistency-working', failureShot: '09-failure.png', body: ({ fixture, page, timeline }) => scenarioProgressWorking({ fixture, page, timeline, shots: {
+    working: shot(page, '09-working-immediately.png'), reload: shot(page, '10-working-after-reload.png'),
+    awaiting: shot(page, '11-awaiting-decision.png'), completed: shot(page, '12-completed-next-step.png') } }) });
+  await runScenario({ ...shared, name: 'progress-consistency-blocked', failureShot: '13-failure.png', body: ({ fixture, page, timeline }) => scenarioProgressBlocked({ fixture, page, timeline, shots: {
+    blocked: shot(page, '13-blocked-next-step.png') } }) });
+  await runScenario({ ...shared, name: 'progress-lost-submission', failureShot: '14-failure.png',
+    body: args => scenarioLostSubmission({ ...args, kit: assertionKit(), login }) });
+  await runScenario({ ...shared, name: 'progress-recovery-status-edges', failureShot: '15-failure.png',
+    body: args => scenarioRecoveryStatusEdges({ ...args, kit: assertionKit(), login }) });
+
   // Assignment drafting scenarios — one fresh fixture each, synthetic coding connection.
   for (const scenario of ASSIGNMENT_SCENARIOS) {
     const { cleanup } = await withFixture(evidenceDir, async ({ fixture, browser }) => {
@@ -379,22 +704,36 @@ async function runOnce({ evidenceDir, netnsReported }) {
     secretsScrubNote: 'Owner email/password/auth secret generated per fixture and never written into this report.',
   };
 
-  const raw = JSON.stringify(report, null, 2);
-  const scrubbed = scrubArtifactText(raw, secrets);
-  await writeFile(join(evidenceDir, 'report.json'), scrubbed);
-  // Grep evidence dir for secrets
-  const leakCheck = { checkedAt: phxNow(), leaks: [] };
-  for (const secret of secrets) {
-    if (!secret) continue;
-    const { stdout } = await execFile('bash', ['-lc', `grep -R --fixed-strings -l -- ${JSON.stringify(secret)} ${JSON.stringify(evidenceDir)} 2>/dev/null || true`]);
-    if (stdout.trim()) leakCheck.leaks.push({ hint: secret.slice(0, 4) + '…', files: stdout.trim().split('\n') });
+  report.networkCoverage = report.networkCoverage || {};
+  report.networkCoverage.netnsAvailable = netnsAvailable;
+  report.networkCoverage.netns = Boolean(netnsReported);
+  if (netnsReported) {
+    report.networkCoverage.netnsNote = 'verification re-exec under unshare -rn with lo up';
   }
-  await writeFile(join(evidenceDir, 'scrub-check.json'), JSON.stringify(leakCheck, null, 2));
-  if (leakCheck.leaks.length) {
-    report.ok = false;
-    report.scrubFailure = leakCheck;
-  }
-  return report;
+
+  // This is the final write: nothing after this call may touch report.json.
+  return scrubAndWriteReport(evidenceDir, report, secrets);
+}
+
+/**
+ * Test-only seam: when EVE_RSV_TEST_STUB=leak is set, main() skips the real
+ * browser run entirely and instead plants a stray unscrubbed secret in the
+ * evidence dir before calling the real scrubAndWriteReport with an
+ * otherwise-ok report — driving the full CLI (persisted report.json +
+ * process exit code, on both the plain and --netns paths) through the exact
+ * "fresh report, leak found late" case without needing a browser. Not
+ * referenced anywhere in normal operation.
+ */
+async function runOnceStubLeak({ evidenceDir }) {
+  const secret = process.env.EVE_RSV_TEST_STUB_SECRET || 'EVE_RSV_TEST_STUB_SECRET_VALUE';
+  await writeFile(join(evidenceDir, 'stray-leftover.log'), `debug dump: ${secret}\n`);
+  const report = { generatedAt: phxNow(), ok: true, stub: 'leak' };
+  return scrubAndWriteReport(evidenceDir, report, [secret]);
+}
+
+async function runOnceForMode(opts) {
+  if (process.env.EVE_RSV_TEST_STUB === 'leak') return runOnceStubLeak(opts);
+  return runOnce(opts);
 }
 
 async function main() {
@@ -405,6 +744,10 @@ async function main() {
   }
   const evidenceDir = resolve(args.evidence || join(tmpdir(), `eve-rsv-${phxStamp()}`));
   await mkdir(evidenceDir, { recursive: true });
+  const reportPath = join(evidenceDir, 'report.json');
+  // Clear prior results before building as well as before a namespace child.
+  // A failed build must not leave an older success report for this invocation.
+  await rm(reportPath, { force: true });
 
   if (!args.skipBuild) {
     const build = await ensureSpaBuild();
@@ -416,8 +759,15 @@ async function main() {
     // Bring up loopback inside new netns and re-exec
     const self = fileURLToPath(import.meta.url);
     const childArgs = [self, '--evidence', evidenceDir, '--skip-build'];
+    // A report.json left over from an earlier run must never be mistaken for
+    // this child's output: remove it before spawning so a crashed/short-circuited
+    // child (e.g. missing `ip`) can't have its failure masked by a stale file.
+    await rm(reportPath, { force: true });
     const result = await new Promise((resolvePromise) => {
-      const child = spawn('unshare', ['-rn', 'bash', '-lc', `ip link set lo up 2>/dev/null || true; EVE_RSV_IN_NETNS=1 HOME=${JSON.stringify(process.env.HOME)} PATH=${JSON.stringify(process.env.PATH)} CI=true ${JSON.stringify(process.execPath)} ${childArgs.map(a => JSON.stringify(a)).join(' ')}; echo EXIT:$?`], {
+      const innerCommand = `EVE_RSV_IN_NETNS=1 HOME=${JSON.stringify(process.env.HOME)} PATH=${JSON.stringify(process.env.PATH)} CI=true ${JSON.stringify(process.execPath)} ${childArgs.map(a => JSON.stringify(a)).join(' ')}`;
+      const bashScript = buildNetnsWrapperScript(innerCommand);
+      // Preserve the supplied PATH for the loopback check and child command.
+      const child = spawn('unshare', ['-rn', 'bash', '-c', bashScript], {
         stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, EVE_RSV_IN_NETNS: '1' },
       });
       let out = ''; let err = '';
@@ -425,17 +775,19 @@ async function main() {
       child.stderr.on('data', d => { err += d; process.stderr.write(d); });
       child.on('exit', code => resolvePromise({ code, out, err }));
     });
-    // Prefer report written by child
-    try {
-      const report = JSON.parse(await readFile(join(evidenceDir, 'report.json'), 'utf8'));
-      report.networkCoverage = report.networkCoverage || {};
-      report.networkCoverage.netns = true;
-      report.networkCoverage.netnsNote = 'verification re-exec under unshare -rn with lo up';
-      await writeFile(join(evidenceDir, 'report.json'), JSON.stringify(report, null, 2));
-      process.exit(report.ok ? 0 : 1);
-    } catch {
-      console.error('netns child failed', result.code, result.err.slice(0, 500));
+    if (result.code !== 0) {
+      // The child never got to (re-)write report.json, so there is nothing
+      // trustworthy to read; honor its exit code instead of a stale/missing file.
+      console.error('netns child exited non-zero', result.code, result.err.slice(0, 500));
       process.exit(result.code || 1);
+    }
+    // Prefer report written by child (already the scrubbed, final artifact).
+    try {
+      const report = JSON.parse(await readFile(reportPath, 'utf8'));
+      process.exit(report.ok ? 0 : 1);
+    } catch (e) {
+      console.error('netns child exited 0 but left no valid report.json', e.message);
+      process.exit(1);
     }
   }
 
@@ -446,16 +798,30 @@ async function main() {
     netnsAvailable = true;
   } catch { netnsAvailable = false; }
 
-  const report = await runOnce({ evidenceDir, netnsReported: process.env.EVE_RSV_IN_NETNS === '1' });
-  report.networkCoverage = report.networkCoverage || {};
-  report.networkCoverage.netnsAvailable = netnsAvailable;
-  report.networkCoverage.netns = process.env.EVE_RSV_IN_NETNS === '1';
-  await writeFile(join(evidenceDir, 'report.json'), JSON.stringify(report, null, 2));
-  console.log(JSON.stringify({ ok: report.ok, evidenceDir, scenarios: report.scenarios.map(s => ({ name: s.name, ok: s.ok, error: s.error })) }, null, 2));
+  const report = await runOnceForMode({ evidenceDir, netnsReported: process.env.EVE_RSV_IN_NETNS === '1', netnsAvailable });
+  console.log(JSON.stringify({ ok: report.ok, evidenceDir, scenarios: (report.scenarios || []).map(s => ({ name: s.name, ok: s.ok, error: s.error })) }, null, 2));
   process.exit(report.ok ? 0 : 1);
 }
 
-main().catch(err => {
-  console.error(err);
-  process.exit(1);
-});
+// True when this file is the process entry point, not just imported (e.g. by
+// a unit test that only needs scrubAndWriteReport). Compares real paths (not
+// just the literal argv[1] string) so launching through a symlink still
+// resolves to "this is main" instead of silently skipping main() and exiting 0.
+function isEntryPoint() {
+  if (!process.argv[1]) return false;
+  const scriptPath = fileURLToPath(import.meta.url);
+  const invokedPath = resolve(process.argv[1]);
+  if (scriptPath === invokedPath) return true;
+  try {
+    return realpathSync(scriptPath) === realpathSync(invokedPath);
+  } catch {
+    return false;
+  }
+}
+
+if (isEntryPoint()) {
+  main().catch(err => {
+    console.error(err);
+    process.exit(1);
+  });
+}
