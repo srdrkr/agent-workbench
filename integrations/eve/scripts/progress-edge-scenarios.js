@@ -75,6 +75,7 @@ export async function scenarioRecoveryStatusEdges({ fixture, page, kit, login })
   await page.waitForFunction(() => [...document.querySelectorAll('button')].some(b => b.textContent.trim() === 'Retry this request once' && !b.disabled), null, { timeout: 15000 });
   await fixture.store.change(s => { s.budgetMicros = s.reservedMicros; });
   await page.getByRole('button', { name: 'Refresh status', exact: true }).click();
+  await page.waitForFunction(() => [...document.querySelectorAll('button')].some(b => b.textContent.trim() === 'Retry this request once' && b.disabled), null, { timeout: 15000 });
   if (!await retry.isDisabled()) kit.fail('exhausted-allowance-retry-enabled', 'Retry enabled at dollar limit');
   kit.pass('retry-controls-follow-wait-and-allowance', { waitRefreshed: true, allowanceBlocked: true });
 
