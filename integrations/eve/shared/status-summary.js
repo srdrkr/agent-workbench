@@ -193,7 +193,8 @@ function next(f) {
   if (failedStart && !job.releasedAt) return ['review the failed coding start in the web app', '', 'blocked'];
   if (dollarsExhausted) return ['review the pilot allowance; no automatic top-up', '', 'blocked'];
   if (attemptsExhausted) return ['review the pilot allowance', '', 'blocked'];
-  if (awaiting) return [awaiting.proposal.kind === 'coding' ? 'review the coding assignment: ' : 'decide on the proposal: ', awaiting.proposal.title, 'awaiting_decision'];
+  if (awaiting?.draftFeedback?.gap) return ['prepare the assignment manually in the web app: ', awaiting.draftFeedback.gap, 'awaiting_decision'];
+  if (awaiting) return [awaiting.assignmentDraft ? 'review the draft assignment: ' : awaiting.proposal.kind === 'coding' ? 'review the coding assignment: ' : 'decide on the proposal: ', awaiting.proposal.title, 'awaiting_decision'];
   if (needsContext) return ['answer Eve\'s question in a new request: ', needsContext.proposal?.question ?? needsContext.proposal?.title ?? '', 'awaiting_decision'];
   if (notSent) return ['check the allowance and brief size, then ask again', '', 'blocked'];
   if (f.acknowledged) return ['start a fresh request; the failed review stays in history', '', 'ready'];

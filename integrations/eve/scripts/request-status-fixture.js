@@ -29,6 +29,7 @@ import { HOSTED_MODEL } from '../hosted/transport.js';
 import { ownerAuth } from '../hosted/auth.js';
 import { hostedHandler } from '../hosted/http.js';
 import { setupHosted } from '../hosted/setup.js';
+import { HostedCoding } from '../hosted/coding.js';
 import { seedSyntheticTask, runSyntheticReview } from '../test/held-review-fixture.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -179,6 +180,7 @@ export async function createControllableJudge(store, { now = () => new Date().to
   let gate = null;
   let outcome = PROPOSAL_OK;
   let calls = 0;
+  let lastInput = null;
 
   const resetGate = () => {
     let resolve;
@@ -202,6 +204,7 @@ export async function createControllableJudge(store, { now = () => new Date().to
         state.reservedMicros += 1;
       }
     });
+    lastInput = input;
     events.emit('called', { input, calls });
     await gate.promise;
     const current = outcome;
@@ -215,6 +218,7 @@ export async function createControllableJudge(store, { now = () => new Date().to
     judge,
     events,
     get calls() { return calls; },
+    get lastInput() { return lastInput; },
     hold() { resetGate(); },
     async waitUntilCalled({ timeoutMs = 15000, atLeast = 1 } = {}) {
       if (calls >= atLeast) return { calls };
@@ -253,12 +257,22 @@ export async function startRequestStatusFixture({
   staticRoot,
   budgetMicros = 1_000_000,
   projectPath = join(repoRoot, 'fixtures/steward-project.json'),
+  project: projectOverride = null,
+  // Optional synthetic coding connection: a fixed spec, an in-memory repository reader
+  // and an in-process Routine recorder. Nothing leaves the process.
+  coding: codingOptions = null,
+  clockStart = null,
 } = {}) {
   if (!pgDir) throw new Error('PG_DIR_REQUIRED');
   const assets = await resolveClientAssets(eveRoot);
   const clientDir = staticRoot || assets.clientDir;
   const html = assets.indexHtml;
-  const project = JSON.parse(await readFile(projectPath, 'utf8'));
+  const project = projectOverride ? structuredClone(projectOverride) : JSON.parse(await readFile(projectPath, 'utf8'));
+  // Deterministic application clock: fixed start, real elapsed time, explicit advances.
+  const clockBase = clockStart ? Date.parse(clockStart) - Date.now() : 0;
+  let clockAdvance = 0;
+  const now = () => new Date(Date.now() + clockBase + clockAdvance).toISOString();
+  const codingSends = [];
   const ownerEmail = `owner-${randomBytes(8).toString('hex')}@example.com`;
   const password = `pw-${randomBytes(24).toString('base64url')}`;
   const secret = randomBytes(32).toString('base64url');
@@ -359,8 +373,17 @@ export async function startRequestStatusFixture({
     budgetMicros,
   });
   store = new HostedStore(pool, { ownerId: ownerEmail, projectId: project.id });
-  judgeControl = await createControllableJudge(store);
-  steward = new HostedSteward(store, judgeControl.judge);
+  judgeControl = await createControllableJudge(store, { now });
+  const coding = codingOptions ? new HostedCoding(store, {
+    now, read: codingOptions.read,
+    config: { spec: codingOptions.spec, repeatable: true, verifiedUntil: codingOptions.verifiedUntil, token: 'synthetic-routine-token-never-sent' },
+    send: async payload => { codingSends.push({ at: now(), routineId: payload.routineId, text: payload.text }); return { outcome: 'accepted' }; },
+  }) : null;
+  steward = new HostedSteward(store, judgeControl.judge, { now, coding });
+  if (coding) {
+    const review = await steward.reviewPilot({ budgetMicros, maxProviderAttempts: 50 });
+    await steward.approvePilot({ reviewHash: review.reviewHash });
+  }
   const auth = ownerAuth(pool, { origin, secret });
   handler = hostedHandler({ auth, steward, ownerEmail, origin });
 
@@ -380,6 +403,9 @@ export async function startRequestStatusFixture({
     /** @deprecated do not log — in-process only */
     _credentials: credentials,
     getOwnerLogin() { return { email: ownerEmail, password }; },
+    codingSends,
+    now,
+    advanceClock(ms) { clockAdvance += ms; return now(); },
     /** Approves a pilot, seeds one synthetic closed task and runs one real review with a fake provider outcome. */
     async prepareHeldReview(outcome) {
       const now = () => new Date().toISOString();
@@ -407,7 +433,7 @@ export async function startRequestStatusFixture({
           'live AI Gateway / Anthropic transport',
           'live Postgres',
           'Telegram',
-          'coding dispatch (held-review task is synthetic seed)',
+          codingOptions ? 'live coding dispatch (Routine fire replaced by an in-process recorder; GitHub reads by a static synthetic reader)' : 'coding dispatch',
           'live GitHub reads (synthetic reader)',
         ],
       };

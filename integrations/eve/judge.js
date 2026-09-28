@@ -1,5 +1,5 @@
 import { Client } from 'eve/client';
-import { proposalSchema, codeReviewSchema } from './schema.js';
+import { proposalSchema, codeReviewSchema, draftProposalSchema } from './schema.js';
 import { judgmentObservation } from './stream-policy.js';
 
 /** Server-side adapter. Its caller owns disclosure approval and proposal authority. */
@@ -16,9 +16,11 @@ export async function createEveJudge(config = {}) {
   if (!Number.isInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 60_000) {
     throw new Error('JUDGE_CONFIG_INVALID');
   }
-  const schema = config.review === true ? codeReviewSchema : proposalSchema;
   const client = new Client({ host: host.href, auth: { bearer: config.authToken }, redirect: 'error' });
-  return async ({ request, project, commitments, hostedRequestId }) => {
+  return async ({ request, project, commitments, hostedRequestId, mode }) => {
+    // `assignment_draft` only selects a larger bounded output shape; it grants nothing.
+    const drafting = config.review !== true && mode === 'assignment_draft';
+    const schema = config.review === true ? codeReviewSchema : drafting ? draftProposalSchema : proposalSchema;
     // Disclosure is all-or-nothing: silently dropping sources would mislabel the
     // project revision. Old commitments need a fresh owner-approved export.
     if (typeof project?.revision !== 'string' || !project.revision
@@ -30,8 +32,8 @@ export async function createEveJudge(config = {}) {
     }
     let message;
     try {
-      if (config.hosted && !/^[a-z0-9][a-z0-9-]{0,63}$/.test(hostedRequestId ?? '')) throw new Error();
-      message = JSON.stringify({ request, project, commitments, ...(config.hosted ? { hostedRequestId } : {}), ...(config.review === true ? { mode: 'coding_review' } : {}) });
+      if ((config.hosted && !/^[a-z0-9][a-z0-9-]{0,63}$/.test(hostedRequestId ?? '')) || ![undefined, 'assignment_draft'].includes(mode)) throw new Error();
+      message = JSON.stringify({ request, project, commitments, ...(config.hosted ? { hostedRequestId } : {}), ...(config.review === true ? { mode: 'coding_review' } : drafting ? { mode } : {}) });
       if (typeof request !== 'string' || !request.trim() || !project || !Array.isArray(commitments)
           || Buffer.byteLength(message) > 32_768) throw new Error();
     } catch { throw new Error('JUDGE_INPUT_INVALID'); }

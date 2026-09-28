@@ -12,8 +12,9 @@ export function loadPendingRequest(storage, projectId) {
     const r = JSON.parse(storage.getItem(PENDING_REQUEST_KEY) ?? 'null');
     if (!r || r.projectId !== projectId || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(r.id)
       || typeof r.message !== 'string' || !r.message.trim() || r.message.length > 2000
-      || !/^[a-f0-9]{64}$/.test(r.expectedContextRevision) || !Number.isFinite(Date.parse(r.createdAt))) return null;
+      || !/^[a-f0-9]{64}$/.test(r.expectedContextRevision) || !Number.isFinite(Date.parse(r.createdAt))
+      || ![undefined, 'assignment_draft'].includes(r.mode)) return null;
     return { id: r.id, projectId: r.projectId, expectedContextRevision: r.expectedContextRevision,
-      message: r.message, createdAt: r.createdAt, unknown: true, reconciled: false };
+      message: r.message, createdAt: r.createdAt, ...(r.mode ? { mode: r.mode } : {}), unknown: true, reconciled: false };
   } catch { return null; }
 }
