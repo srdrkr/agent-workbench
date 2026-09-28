@@ -86,10 +86,10 @@ test('/status sends the shared summary within 280 characters including the revie
   await f.channel.receive(request({ ...update, message: { ...update.message, text: '/status' } }), f.schedule);
   await Promise.all(f.jobs);
   assert.deepEqual(f.counts(), { calls: 0, sends: 1 });
-  assert.equal(text, statusSummary(await f.steward.view(), { link: config.origin }));
+  assert.equal(text, statusSummary(await f.steward.view(), { link: config.origin, state: true }));
   assert.ok(text.length <= 280, `${text.length} characters`);
   assert.ok(text.endsWith(`\n${config.origin}`));
   assert.equal(text.split(config.origin).length, 2);
   assert.match(text, /draft PR passed required checks; Claude finish unconfirmed/);
-  assert.match(text, /^Progress: .+\. Blocker: .+\. Next: .+\.\n/);
+  assert.match(text, /^State: Your decision needed\. Progress: .+\. Blocker: .+\. Next: .+\.\n/);
 });

@@ -36,7 +36,8 @@ export default defineAgent({
                 rationale: 'Fixture proposal: choose the supplied bounded coding candidate and review its result before expanding scope.',
                 citations: candidate.sourceIds, question: null };
             }
-            return { toolCalls: [{ name: output.name, input: proposal }] };
+            // Draft mode uses a schema with a required nullable draft; the fixture never invents one.
+            return { toolCalls: [{ name: output.name, input: input.mode === 'assignment_draft' ? { ...proposal, draft: null } : proposal }] };
           });
         } else if (['gateway-eval', 'gateway-eval-mock'].includes(process.env.WORKBENCH_EVE_MODE ?? '')) {
           const mock = process.env.WORKBENCH_EVE_MODE === 'gateway-eval-mock';
