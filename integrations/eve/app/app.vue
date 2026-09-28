@@ -65,20 +65,22 @@ async function submitRequest(request) {
   await action(async () => {
     // Persist the ID before sending. A user-initiated resend uses this same ID
     // and text, so a late original response cannot create a second reservation.
-    savePendingRequest(sessionStorage, request);
+    try { savePendingRequest(sessionStorage, request); }
+    catch { throw new Error('Nothing was sent. Enable browser session storage so Eve can save your request ID before sending.'); }
     pending.value = { ...request, unknown: false, reconciled: false };
     try {
       notice.value = 'Eve is considering your request. This can take about a minute.';
       const result = await api('steward/propose', { requestId: request.id, projectId: request.projectId,
         expectedContextRevision: request.expectedContextRevision, message: request.message });
       message.value = ''; await refresh();
-      notice.value = result.proposal ? `Eve replied: ${result.proposal.title}. See the newest decision below.` : 'Your request is saved, but Eve did not return a verified result. See the latest decision.'; document.getElementById('decisions')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      notice.value = result.status === 'thinking' ? 'Eve is still working on your saved request. You do not need to send it again.'
+        : result.proposal ? `Eve replied: ${result.proposal.title}. See the newest decision below.` : 'Your request is saved, but Eve did not return a verified result. See the latest decision.'; document.getElementById('decisions')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
     } catch (e) {
       notice.value = '';
       // These errors are raised before proposal admission, unlike a transport
       // failure or an unrecognized server response, whose outcome is unknown.
-      if (['INVALID_REQUEST', 'ADMISSION_PAUSED', 'CONTEXT_EXPIRED', 'CONTEXT_NOT_APPROVED', 'CONTEXT_TOO_LARGE'].includes(e.code)) {
-        clearPending(); throw e;
+      if (['INVALID_REQUEST', 'ADMISSION_PAUSED', 'CONTEXT_EXPIRED', 'CONTEXT_NOT_APPROVED', 'CONTEXT_TOO_LARGE', 'UNRESOLVED_MODEL_ATTEMPT'].includes(e.code)) {
+        clearPending(); await refresh().catch(() => {}); throw e;
       }
       pending.value = { ...request, unknown: true, reconciled: false };
       await refresh().catch(() => {});

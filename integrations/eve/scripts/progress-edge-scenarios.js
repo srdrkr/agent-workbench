@@ -39,7 +39,13 @@ export async function scenarioLostSubmission({ fixture, page, kit, login }) {
   await page.getByRole('button', { name: 'Retry saved request', exact: true }).waitFor({ timeout: 20000 });
   await page.reload({ waitUntil: 'domcontentloaded' });
   await page.getByRole('button', { name: 'Retry saved request', exact: true }).waitFor({ timeout: 20000 });
+  // The original can arrive after the status read but before its explicit retry.
+  fixture.judge.hold();
+  const underway = fixture.steward.propose(sent[1]);
+  await fixture.judge.waitUntilCalled({ atLeast: 2, timeoutMs: 20000 });
   await page.getByRole('button', { name: 'Retry saved request', exact: true }).click();
+  await page.getByText('Eve is still working on your saved request. You do not need to send it again.', { exact: true }).waitFor({ timeout: 20000 });
+  fixture.judge.release(); await underway;
   await page.waitForFunction(() => [...document.querySelectorAll('article.decision h3')].filter(el => el.textContent === 'Confirm the normalization priority').length === 2, null, { timeout: 20000 });
   await page.getByRole('button', { name: 'Refresh status', exact: true }).click();
   if (sent.length !== 3 || sent[1].requestId !== sent[2].requestId || sent[1].message !== sent[2].message) kit.fail('saved-retry-changed-request', JSON.stringify(sent.map(s => s.requestId)));
@@ -53,6 +59,19 @@ export async function scenarioLostSubmission({ fixture, page, kit, login }) {
   }, sent[2]);
   if (fixture.judge.calls !== 2 || (await fixture.store.read()).reservedMicros !== before) kit.fail('completed-id-replay-called-model', 'call or allowance changed');
   kit.pass('saved-id-survives-reload-and-retry-is-idempotent', { calls: fixture.judge.calls, reservationRetained: true });
+
+  // A different tab can start work after this tab's last state read. A definite
+  // refusal must expose that work, not invent a second uncertain submission.
+  fixture.judge.hold();
+  const other = fixture.steward.propose({ ...sent[2], requestId: 'another-tab-request' });
+  await fixture.judge.waitUntilCalled({ atLeast: 3, timeoutMs: 20000 });
+  await page.getByLabel('Request to Eve').fill('Synthetic: refused while another request runs.');
+  await page.getByRole('button', { name: 'Ask Eve', exact: true }).click();
+  await page.getByText('A prior request needs review before another can run.', { exact: true }).waitFor({ timeout: 20000 });
+  if (await page.getByText('Submission outcome unknown', { exact: true }).count()) kit.fail('definite-refusal-shown-as-unknown', 'unknown marker remains');
+  if (await page.evaluate(key => sessionStorage.getItem(key), PENDING_REQUEST_KEY)) kit.fail('definite-refusal-kept-receipt', 'receipt remains');
+  fixture.judge.release(); await other;
+  kit.pass('definite-refusal-shows-existing-work', { calls: fixture.judge.calls });
   return kit.assertions;
 }
 

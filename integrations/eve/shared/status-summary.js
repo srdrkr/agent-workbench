@@ -13,7 +13,7 @@ import { followThroughNotice } from './follow-through-notice.js';
  *
  * Owner state: every Next branch also names one state, so the state and the next
  * step can never disagree: working (a recorded request or observed session is in
- * progress), awaiting_decision, blocked, completed, or ready (nothing recorded).
+ * progress), awaiting_decision, blocked, decision_recorded, completed, or ready.
  */
 export const STATUS_SUMMARY_LIMIT = 280;
 // Past the expected request window, an absent result means the outcome is unknown.
