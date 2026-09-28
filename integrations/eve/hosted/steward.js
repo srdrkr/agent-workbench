@@ -103,13 +103,12 @@ export class HostedSteward {
         // hash) keeps the existing strict shape. Semantic draft problems are flagged,
         // not fatal; a malformed draft invalidates the output like any malformed field.
         const { draft = null, ...withoutDraft } = proposal;
-        let core = record.mode === 'assignment_draft' ? withoutDraft : proposal;
+        const core = record.mode === 'assignment_draft' ? withoutDraft : proposal;
         validateProposal(core, record.contextSnapshot);
         if (draft !== null && core.kind === 'plan') {
           const checked = validateAssignmentDraft(draft, { project: record.contextSnapshot, approvedProject: state.project, request: record.message, proposal: core });
           if (checked.gap) {
             record.draftFeedback = { gap: checked.gap, flags: checked.flags };
-            core = { ...core, kind: 'clarify', candidateId: null, question: checked.gap };
           } else record.assignmentDraft = checked;
         } else if (draft !== null) record.draftIgnored = 'not_a_plan';
         record.proposal = core;

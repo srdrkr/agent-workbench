@@ -143,22 +143,18 @@ test('missing context produces one focused question and no draft', async t => {
   await assert.rejects(w.coding.prepare({ requestId: 'from-gap', fromRequestId: 'gap-one', objective: GAP_REQUEST, acceptance: 'x', allowedPaths: ['src/slug.js'], expectedContextRevision: w.revision }), /APPROVAL_MISMATCH/);
 });
 
-test('overlong composition asks for narrower context; a refreshed brief can produce a usable draft', async t => {
+test('overlong composition keeps manual preparation available without another judge call', async t => {
   const w = await world(t);
   const large = { ...structuredClone(ASSIGNMENT_PROJECT), sources: ASSIGNMENT_PROJECT.sources.map(s => ({ ...s, content: `${s.content} ${'x'.repeat(1500)}` })) };
-  let preview = await w.steward.previewContext(large);
+  const preview = await w.steward.previewContext(large);
   await w.steward.applyContext({ previewId: preview.id, expectedRevision: preview.expectedRevision });
-  let revision = (await w.store.read()).project.revision;
+  const revision = (await w.store.read()).project.revision;
   const blocked = await w.steward.propose({ requestId: 'large-one', projectId: ASSIGNMENT_PROJECT.id, message: SUFFICIENT_REQUEST, mode: 'assignment_draft', expectedContextRevision: revision });
-  assert.equal(blocked.status, 'needs_context'); assert.equal(blocked.assignmentDraft, undefined);
-  assert.match(blocked.proposal.question, /^Which referenced context/);
-  await assert.rejects(w.coding.prepare({ requestId: 'large-assignment', fromRequestId: blocked.id, objective: 'x', acceptance: 'x', allowedPaths: ['src/slug.js'], expectedContextRevision: revision }), /APPROVAL_MISMATCH/);
-  preview = await w.steward.previewContext(structuredClone(ASSIGNMENT_PROJECT));
-  await w.steward.applyContext({ previewId: preview.id, expectedRevision: preview.expectedRevision });
-  revision = (await w.store.read()).project.revision;
-  const resolved = await w.steward.propose({ requestId: 'small-one', projectId: ASSIGNMENT_PROJECT.id, message: SUFFICIENT_REQUEST, mode: 'assignment_draft', expectedContextRevision: revision });
-  const review = await w.coding.prepare({ requestId: 'small-assignment', fromRequestId: resolved.id, ...resolved.assignmentDraft.composed, expectedContextRevision: revision });
-  assert.equal(review.requestId, 'small-assignment'); assert.equal(w.calls.sends.length, 0);
+  assert.equal(blocked.status, 'awaiting_approval'); assert.equal(blocked.assignmentDraft, undefined);
+  assert.match(blocked.draftFeedback.gap, /^Which referenced context/);
+  assert.match(statusSummary(await w.steward.view()), /prepare the assignment manually/);
+  const review = await w.coding.prepare({ requestId: 'manual-assignment', fromRequestId: blocked.id, objective: SUFFICIENT_REQUEST, acceptance: 'Normalize spaces and pass the existing tests.', allowedPaths: ['src/slug.js'], expectedContextRevision: revision });
+  assert.equal(review.requestId, 'manual-assignment'); assert.equal(w.calls.sends.length, 0); assert.equal(w.calls.judge, 1);
 });
 
 test('a file mentioned only in derived project progress is not approved brief scope', async t => {
@@ -167,7 +163,7 @@ test('a file mentioned only in derived project progress is not approved brief sc
   await w.steward.saveNote({ text: 'Consider src/notes-only.js', kind: 'note', expectedContextRevision: w.revision });
   const r = await w.steward.propose({ requestId: 'notes-scope', projectId: ASSIGNMENT_PROJECT.id, message: SUFFICIENT_REQUEST, mode: 'assignment_draft', expectedContextRevision: w.revision });
   assert.ok(w.calls.lastInput.project.sources.find(s => s.id === 'project-progress').content.includes('src/notes-only.js'));
-  assert.equal(r.status, 'needs_context'); assert.equal(r.assignmentDraft, undefined);
+  assert.equal(r.status, 'awaiting_approval'); assert.equal(r.assignmentDraft, undefined);
   assert.deepEqual(r.draftFeedback.flags.map(f => [f.value, f.reason]), [['src/notes-only.js', 'not_in_approved_context']]);
   assert.equal(w.calls.sends.length, 0);
 });

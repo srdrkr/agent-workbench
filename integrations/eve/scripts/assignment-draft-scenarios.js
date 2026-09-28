@@ -5,7 +5,7 @@
  * "send" is observable without any network. No sleeps.
  */
 import { ASSIGNMENT_PROJECT, DRAFT_CODING_SPEC, draftRepositoryReader, SUFFICIENT_REQUEST, GAP_REQUEST,
-  DRAFT_OK, DRAFT_WITH_INVALID, DRAFT_GAP } from '../test/assignment-draft-fixture.js';
+  DRAFT_OK, DRAFT_WITH_INVALID, DRAFT_GAP, DRAFT_NO_SCOPE } from '../test/assignment-draft-fixture.js';
 
 // Ten minutes before the synthetic brief expires: long enough for every scenario,
 // short enough that the stale scenario can expire the brief while the 15-minute
@@ -172,9 +172,41 @@ export async function scenarioDraftStale({ fixture, page, shot }) {
   return r.assertions;
 }
 
+async function scenarioManualDraft({ fixture, page, shot, largeProgress = false }) {
+  const r = recorder();
+  let request = SUFFICIENT_REQUEST;
+  let response = DRAFT_NO_SCOPE;
+  if (largeProgress) {
+    const revision = (await fixture.store.read()).project.revision;
+    for (let i = 0; i < 3; i++) await fixture.steward.saveNote({ text: `Synthetic note ${i}: ${'x'.repeat(900)}`, kind: 'note', expectedContextRevision: revision });
+    await fixture.steward.saveNote({ text: `Synthetic priority: ${'x'.repeat(900)}`, kind: 'priority', expectedContextRevision: revision });
+    request += `\nSynthetic detail: ${'x'.repeat(1700)}`;
+    response = { ...DRAFT_OK, citations: [...DRAFT_OK.citations, 'project-progress'] };
+  }
+  await askForDraft(page, fixture, request, response);
+  await page.getByRole('button', { name: 'Prepare assignment manually', exact: true }).waitFor({ timeout: 20000 });
+  check(r, 'manual-next-step', /prepare the assignment manually/.test(await page.locator('p.summary').innerText()), 'manual preparation');
+  const record = (await state(page)).requests.find(x => x.draftFeedback);
+  check(r, 'gap-without-unusable-prefill', !record.assignmentDraft && (largeProgress ? /^Which referenced context/ : /^Which existing files/).test(record.draftFeedback.gap), record.draftFeedback.gap);
+  await page.getByRole('button', { name: 'Prepare assignment manually', exact: true }).click();
+  await page.locator('[data-manual-draft]').waitFor({ timeout: 10000 });
+  check(r, 'manual-form-retains-outcome', await field(page, OBJECTIVE).inputValue() === request, 'verbatim');
+  check(r, 'manual-scope-not-invented', await field(page, PATHS).inputValue() === '' && await field(page, ACCEPTANCE).inputValue() === '', 'owner supplies scope and acceptance');
+  check(r, 'all-context-available-to-owner', await page.locator('[data-manual-draft] details').count() === record.contextSnapshot.sources.length, 'all snapshot sources');
+  await field(page, OBJECTIVE).fill(`${request}\nOwner selected context: normalize whitespace only.`);
+  await field(page, ACCEPTANCE).fill('Leading, repeated and trailing spaces normalize. Existing node tests pass.');
+  await field(page, PATHS).fill('src/slug.js');
+  await prepare(page);
+  check(r, 'manual-preparation-needs-no-new-judge-or-dispatch', fixture.judge.calls === 1 && fixture.codingSends.length === 0, { judge: fixture.judge.calls, sends: fixture.codingSends.length });
+  await shot(largeProgress ? '17-large-context-manual-review' : '16-missing-scope-manual-review');
+  return r.assertions;
+}
+
 export const ASSIGNMENT_SCENARIOS = [
   { name: 'assignment-draft-edit-approve', run: scenarioDraftEditApprove, failureShot: '05-failure' },
   { name: 'assignment-draft-gap', run: scenarioDraftGap, failureShot: '09-failure' },
   { name: 'assignment-draft-invalid-path', run: scenarioDraftInvalidPath, failureShot: '10-failure' },
   { name: 'assignment-draft-stale', run: scenarioDraftStale, failureShot: '11-failure' },
+  { name: 'assignment-draft-manual-scope', run: args => scenarioManualDraft(args), failureShot: '16-failure' },
+  { name: 'assignment-draft-manual-context', run: args => scenarioManualDraft({ ...args, largeProgress: true }), failureShot: '17-failure' },
 ];
