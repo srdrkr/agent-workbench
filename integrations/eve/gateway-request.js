@@ -1,12 +1,17 @@
 export const endpoint = 'https://ai-gateway.vercel.sh/v4/ai/language-model';
 
-// Anthropic strict tools do not accept string length or array maximum bounds.
+// Anthropic strict tools do not accept string length, array maximum or numeric bounds.
 // Keep those constraints in descriptions and in the original local Zod schema.
 function strictToolSchema(schema) {
-  const { minLength, maxLength, maxItems, ...result } = schema;
+  const { minLength, maxLength, maxItems, minimum, maximum, exclusiveMinimum, exclusiveMaximum, multipleOf, ...result } = schema;
   const bounds = [minLength === undefined ? '' : `Minimum string length: ${minLength}.`,
     maxLength === undefined ? '' : `Maximum string length: ${maxLength}.`,
-    maxItems === undefined ? '' : `Maximum array length: ${maxItems}.`].filter(Boolean);
+    maxItems === undefined ? '' : `Maximum array length: ${maxItems}.`,
+    minimum === undefined ? '' : `Minimum value (inclusive): ${minimum}.`,
+    maximum === undefined ? '' : `Maximum value (inclusive): ${maximum}.`,
+    exclusiveMinimum === undefined ? '' : `Value must be greater than ${exclusiveMinimum}.`,
+    exclusiveMaximum === undefined ? '' : `Value must be less than ${exclusiveMaximum}.`,
+    multipleOf === undefined ? '' : `Value must be a multiple of ${multipleOf}.`].filter(Boolean);
   if (bounds.length) result.description = [result.description, ...bounds].filter(Boolean).join(' ');
   if (result.properties) result.properties = Object.fromEntries(Object.entries(result.properties).map(([name, value]) => [name, strictToolSchema(value)]));
   if (result.items) result.items = strictToolSchema(result.items);
