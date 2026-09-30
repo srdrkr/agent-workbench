@@ -165,10 +165,18 @@ export function heldRecovery(state, record, now) {
     : kind === 'expired_authority' ? `${authority} The old grant is not resumed; update the brief and start a fresh request, which needs fresh approval.`
       : 'Then start a fresh request with a new request ID. Any new coding work needs its own scope approval.';
   if (!coding) {
-    // Proposal requests keep the existing one-time retry policy; there is no acknowledgement for them.
-    return blocked(kind, { whatHappened, unknown, whoActs: 'Operator',
-      missing: 'Steward has no supported recovery for a held proposal request in this state.',
-      nextStep: 'Keep this held. This record cannot be acknowledged or retried with the current owner controls. The operator must inspect the recorded evidence and remaining admission limits.' });
+    // Preserve the existing one-time retry policy, including its wait and authority gates.
+    // Only non-retryable, transport-confirmed pre-execution refusals can be acknowledged.
+    if (record.purpose !== undefined || record.projectId !== state.project.id || record.retryOf || record.retryRequestId
+      || ![400, 401, 402, 403, 404, 413].includes(e.httpStatus) || rejectionReviewHash(record)) return blocked(kind, {
+      whatHappened, unknown, whoActs: 'Operator', missing: 'This request is outside the non-retryable refusal acknowledgement path.',
+      nextStep: 'Keep this held. An operator must reconcile the recorded refusal, project and linked retry; acknowledgement is unavailable.' });
+    const acknowledgeHash = hash({ id: record.id, purpose: 'proposal_rejection', inputHash: record.inputHash,
+      projectId: record.projectId, contextRevision: record.contextRevision, judge: record.judge,
+      completedAt: record.completedAt, provider: p, case: kind });
+    return { ...base, case: kind, action: 'acknowledge', acknowledgeHash, whatHappened, unknown,
+      whoActs: 'You (the owner)', missing: null,
+      nextStep: `Acknowledge this refused request. Its input, history and reservation stay saved. Nothing is retried. Resolve the provider or brief issue before a fresh request. ${after}` };
   }
   if (!task?.followThrough) return blocked(kind, { whatHappened, unknown, whoActs: 'Operator',
     missing: 'The coding task record for this review is missing.', nextStep: 'Keep this held. The operator must inspect the stored task history; Steward cannot confirm the task stopped.' });
@@ -193,7 +201,7 @@ export function heldRecovery(state, record, now) {
     nextStep: `Acknowledge this failed review. That keeps its history and reservation, sends nothing and does not retry or resume the task. ${after}` };
 }
 
-/** Owner acknowledgement of a confirmed, provider-refused coding review. It resolves only this
+/** Owner acknowledgement of a confirmed, provider-refused non-retryable request or coding review. It resolves only this
  * record's hold; it never retries, resumes a grant, refills allowance, or edits task history. */
 export async function acknowledgeRejectedReview(store, input, now) {
   const { requestId, acknowledgeHash } = input ?? {};
@@ -202,7 +210,7 @@ export async function acknowledgeRejectedReview(store, input, now) {
     const record = own(state.requests, requestId);
     need(record, 'RECOVERY_REVIEW_STALE');
     if (record.status === 'rejection_acknowledged' && record.resolution?.acknowledgeHash === acknowledgeHash) return record;
-    need(record.purpose === 'coding_review', 'RECOVERY_NOT_SUPPORTED');
+    need(record.purpose === 'coding_review' || record.purpose === undefined, 'RECOVERY_NOT_SUPPORTED');
     const recovery = heldRecovery(state, record, now);
     need(recovery, 'RECOVERY_REVIEW_STALE');
     const refusedCases = ['confirmed_rejection', 'expired_authority', 'allowance_exhausted'];

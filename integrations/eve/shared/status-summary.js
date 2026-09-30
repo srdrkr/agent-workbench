@@ -53,7 +53,7 @@ const HELD_CASE = {
 function heldNext(held) {
   const r = held.recovery;
   if (!r) return 'review the held attempt';
-  if (r.action === 'acknowledge') return 'acknowledge the failed review in the web app';
+  if (r.action === 'acknowledge') return held.purpose === 'coding_review' ? 'acknowledge the failed review in the web app' : 'acknowledge the refused request in the web app';
   if (held.retryReviewHash && r.canRetry) return 'use the offered one-time retry in the web app';
   if (r.case === 'uncertain_delivery') return 'operator: check provider usage for the held attempt; do not resend';
   if (/follow-through/i.test(r.whoActs ?? '')) return 'wait for follow-through to stop the task, then acknowledge';
@@ -197,7 +197,7 @@ function next(f) {
   if (awaiting) return [awaiting.assignmentDraft ? 'review the draft assignment: ' : awaiting.proposal.kind === 'coding' ? 'review the coding assignment: ' : 'decide on the proposal: ', awaiting.proposal.title, 'awaiting_decision'];
   if (needsContext) return ['answer Eve\'s question in a new request: ', needsContext.proposal?.question ?? needsContext.proposal?.title ?? '', 'awaiting_decision'];
   if (notSent) return ['check the allowance and brief size, then ask again', '', 'blocked'];
-  if (f.acknowledged) return ['start a fresh request; the failed review stays in history', '', 'ready'];
+  if (f.acknowledged) return [`start a fresh request; the failed ${f.acknowledged.purpose === 'coding_review' ? 'review' : 'request'} stays in history`, '', 'ready'];
   if (v.continuationAvailable) return ['review the next Eve request', '', 'awaiting_decision'];
   if (open) return ['work on: ', open.title, 'decision_recorded'];
   const finished = done || (job && job.releasedAt && result === 'merged_pr') ? 'completed' : 'ready';
