@@ -37,10 +37,10 @@ async function probeApprove(page, body) {
   return page.evaluate(async b => { const r = await fetch('/api/steward/coding/approve', { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(b) }); return { status: r.status, body: await r.json() }; }, body);
 }
 
-async function askForDraft(page, fixture, message, response) {
+async function askForDraft(page, fixture, message, response, { draftMode = true } = {}) {
   fixture.judge.hold();
   await page.getByLabel('Request to Eve').fill(message);
-  await page.getByLabel(/Draft a coding assignment I can review and edit/).check();
+  if (draftMode) await page.getByLabel(/Draft a coding assignment I can review and edit/).check();
   const called = fixture.judge.waitUntilCalled({ timeoutMs: 20000, atLeast: fixture.judge.calls + 1 });
   await page.getByRole('button', { name: 'Ask Eve' }).click();
   await called;
@@ -191,6 +191,8 @@ async function scenarioManualDraft({ fixture, page, shot, largeProgress = false 
   await page.getByRole('button', { name: 'Prepare assignment manually', exact: true }).click();
   await page.locator('[data-manual-draft]').waitFor({ timeout: 10000 });
   check(r, 'manual-form-retains-outcome', await field(page, OBJECTIVE).inputValue() === request, 'verbatim');
+  check(r, 'manual-editor-original-outcome', await page.locator('[data-original-outcome]').textContent() === request, 'verbatim');
+  check(r, 'manual-editor-label-included', /included unchanged/.test(await page.locator('[data-outcome-status]').textContent()), 'included');
   check(r, 'manual-scope-not-invented', await field(page, PATHS).inputValue() === '' && await field(page, ACCEPTANCE).inputValue() === '', 'owner supplies scope and acceptance');
   check(r, 'all-context-available-to-owner', await page.locator('[data-manual-draft] details').count() === record.contextSnapshot.sources.length, 'all snapshot sources');
   await field(page, OBJECTIVE).fill(`${request}\nOwner selected context: normalize whitespace only.`);
@@ -198,11 +200,41 @@ async function scenarioManualDraft({ fixture, page, shot, largeProgress = false 
   await field(page, PATHS).fill('src/slug.js');
   await prepare(page);
   check(r, 'manual-preparation-needs-no-new-judge-or-dispatch', fixture.judge.calls === 1 && fixture.codingSends.length === 0, { judge: fixture.judge.calls, sends: fixture.codingSends.length });
+  check(r, 'manual-review-label-included-without-draft-attribution', await page.locator('[data-review-provenance]').textContent() === 'Your original outcome is included unchanged.', 'owner-prepared');
+  await page.getByRole('button', { name: 'Edit assignment', exact: true }).click();
+  check(r, 'manual-edit-retains-original-outcome', await page.locator('[data-original-outcome]').textContent() === request, 'verbatim');
+  await field(page, OBJECTIVE).fill(`Choose a different outcome.\nApproved context: ${request}`);
+  check(r, 'manual-editor-label-edited', /You edited your original outcome/.test(await page.locator('[data-outcome-status]').textContent()), 'edited');
+  await prepare(page);
+  check(r, 'manual-review-label-edited-without-draft-attribution', await page.locator('[data-review-provenance]').textContent() === 'Your original outcome was edited.', 'edited');
+  check(r, 'manual-edit-needs-no-new-judge-or-dispatch', fixture.judge.calls === 1 && fixture.codingSends.length === 0, { judge: fixture.judge.calls, sends: fixture.codingSends.length });
   await shot(largeProgress ? '17-large-context-manual-review' : '16-missing-scope-manual-review');
   return r.assertions;
 }
 
+export async function scenarioManualPlan({ fixture, page, shot }) {
+  const r = recorder();
+  const { draft, ...plan } = DRAFT_OK;
+  const mode = await askForDraft(page, fixture, SUFFICIENT_REQUEST, plan, { draftMode: false });
+  check(r, 'ordinary-plan-keeps-ordinary-judgment', mode === undefined && fixture.judge.calls === 1, { mode, calls: fixture.judge.calls });
+  await page.getByRole('button', { name: 'Turn this plan into an assignment', exact: true }).waitFor({ timeout: 20000 });
+  await page.getByRole('button', { name: 'Turn this plan into an assignment', exact: true }).click();
+  check(r, 'ordinary-plan-prefills-owner-request-not-title', await field(page, OBJECTIVE).inputValue() === SUFFICIENT_REQUEST && SUFFICIENT_REQUEST !== plan.title, 'verbatim');
+  check(r, 'ordinary-plan-original-outcome-visible', await page.locator('[data-original-outcome]').textContent() === SUFFICIENT_REQUEST, 'verbatim');
+  check(r, 'ordinary-plan-outcome-included', /included unchanged/.test(await page.locator('[data-outcome-status]').textContent()), 'included');
+  await field(page, PATHS).fill('src/slug.js');
+  await prepare(page);
+  check(r, 'ordinary-plan-review-has-no-draft-attribution', await page.locator('[data-review-provenance]').textContent() === 'Your original outcome is included unchanged.', 'owner-prepared');
+  await shot('18-manual-plan-review');
+  await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+  await page.getByRole('button', { name: 'Prepare a coding assignment', exact: true }).click();
+  check(r, 'unlinked-assignment-does-not-claim-outcome', await page.locator('[data-original-outcome]').count() === 0 && await page.locator('[data-outcome-status]').count() === 0, 'unknown');
+  check(r, 'manual-plan-needs-no-extra-judge-or-dispatch', fixture.judge.calls === 1 && fixture.codingSends.length === 0, { judge: fixture.judge.calls, sends: fixture.codingSends.length });
+  return r.assertions;
+}
+
 export const ASSIGNMENT_SCENARIOS = [
+  { name: 'assignment-manual-plan', run: scenarioManualPlan, failureShot: '18-failure' },
   { name: 'assignment-draft-edit-approve', run: scenarioDraftEditApprove, failureShot: '05-failure' },
   { name: 'assignment-draft-gap', run: scenarioDraftGap, failureShot: '09-failure' },
   { name: 'assignment-draft-invalid-path', run: scenarioDraftInvalidPath, failureShot: '10-failure' },
