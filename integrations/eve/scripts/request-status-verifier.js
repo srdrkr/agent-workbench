@@ -301,8 +301,8 @@ async function scenarioRejectedReviewRecovery({ fixture, page, shots }) {
 
   const stateBefore = await fixture.store.read(); const callsBefore = fixture.modelCalls();
   await ack.click();
-  try { await page.getByText('Failed review acknowledged · history kept').waitFor({ timeout: 20000 }); }
-  catch { fail('acknowledgement-not-shown', 'Expected label "Failed review acknowledged · history kept" after acknowledging'); }
+  try { await page.getByText('Failed attempt acknowledged · history kept').waitFor({ timeout: 20000 }); }
+  catch { fail('acknowledgement-not-shown', 'Expected label "Failed attempt acknowledged · history kept" after acknowledging'); }
   const callsAfter = fixture.modelCalls();
   if (!sameCalls(callsBefore, callsAfter)) fail('acknowledge-sent-model-request', JSON.stringify({ callsBefore, callsAfter }));
   pass('acknowledge-no-model-or-routine-request', callsAfter);
@@ -313,7 +313,7 @@ async function scenarioRejectedReviewRecovery({ fixture, page, shots }) {
   pass('records-and-accounting-retained', { reservedMicros: stateAfter.reservedMicros, retained: record.provider.reservedMicros });
 
   await page.reload({ waitUntil: 'domcontentloaded' });
-  try { await page.getByText('Failed review acknowledged · history kept').waitFor({ timeout: 20000 }); }
+  try { await page.getByText('Failed attempt acknowledged · history kept').waitFor({ timeout: 20000 }); }
   catch { fail('acknowledgement-not-persisted', 'label missing after reload'); }
   if (await page.getByRole('button', { name: 'Acknowledge failed review' }).count()) fail('acknowledge-still-offered', 'after reload');
   pass('acknowledgement-persisted-after-reload', true);

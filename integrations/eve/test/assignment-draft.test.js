@@ -7,7 +7,7 @@ import { HostedCoding } from '../hosted/coding.js';
 import { proposalSchema, draftProposalSchema } from '../schema.js';
 import { savePendingRequest, loadPendingRequest } from '../app/utils/pending-request.js';
 import { statusSummary } from '../shared/status-summary.js';
-import { outcomePreserved } from '../shared/assignment-outcome.js';
+import { assignmentOutcome, outcomePreserved } from '../shared/assignment-outcome.js';
 import { validateAssignmentDraft, draftShapeOk, pathEvidence, pathSyntaxOk, SCOPE_GAP_QUESTION, composeAssignment } from '../hosted/assignment-draft.js';
 import { ASSIGNMENT_PROJECT, DRAFT_CODING_SPEC, DRAFT_CLOCK_START, draftRepositoryReader, SUFFICIENT_REQUEST, GAP_REQUEST, UNSCOPED_REQUEST,
   DRAFT_OK, DRAFT_WITH_INVALID, DRAFT_NO_SCOPE, DRAFT_GAP } from './assignment-draft-fixture.js';
@@ -94,6 +94,15 @@ test('an outcome mentioned only inside copied context is not preserved at the st
   assert.equal(outcomePreserved(`${outcome}\nApproved context: ${outcome}`, outcome), true);
   assert.equal(outcomePreserved(`Do something else.\nApproved context: ${outcome}`, outcome), false);
   assert.equal(outcomePreserved(`${outcome} and change billing`, outcome), false);
+  assert.equal(outcomePreserved('\nApproved context', ''), false);
+  assert.equal(outcomePreserved('   ', '   '), false);
+});
+
+test('original outcome uses the saved request for manual assignments and stays unknown without one', () => {
+  assert.equal(assignmentOutcome({ message: 'Owner request', proposal: { title: 'Model paraphrase' } }), 'Owner request');
+  assert.equal(assignmentOutcome({ message: 'Owner request', assignmentDraft: { outcome: 'Saved draft outcome' } }), 'Saved draft outcome');
+  assert.equal(assignmentOutcome({ message: 'Owner request', assignmentDraft: { outcome: '   ' } }), 'Owner request');
+  for (const source of [null, {}, { message: '' }, { message: '   ' }]) assert.equal(assignmentOutcome(source), null);
 });
 
 async function world(t, response = DRAFT_OK, start = DRAFT_CLOCK_START) {
@@ -155,6 +164,38 @@ test('overlong composition keeps manual preparation available without another ju
   assert.match(statusSummary(await w.steward.view()), /prepare the assignment manually/);
   const review = await w.coding.prepare({ requestId: 'manual-assignment', fromRequestId: blocked.id, objective: SUFFICIENT_REQUEST, acceptance: 'Normalize spaces and pass the existing tests.', allowedPaths: ['src/slug.js'], expectedContextRevision: revision });
   assert.equal(review.requestId, 'manual-assignment'); assert.equal(w.calls.sends.length, 0); assert.equal(w.calls.judge, 1);
+});
+
+test('manual plans and draft fallback retain outcome provenance through exact replacement approval', async t => {
+  for (const mode of [undefined, 'assignment_draft']) {
+    const w = await world(t, mode ? DRAFT_NO_SCOPE : core(DRAFT_OK));
+    const plan = await w.steward.propose({ requestId: 'manual-plan', projectId: ASSIGNMENT_PROJECT.id,
+      message: SUFFICIENT_REQUEST, ...(mode ? { mode } : {}), expectedContextRevision: w.revision });
+    assert.equal(plan.status, 'awaiting_approval'); assert.equal(plan.assignmentDraft, undefined);
+    if (mode) assert.ok(plan.draftFeedback, 'unusable draft keeps manual fallback');
+    const form = { fromRequestId: plan.id, objective: `${SUFFICIENT_REQUEST}\nOwner-selected context.`,
+      acceptance: 'Existing tests pass.', allowedPaths: ['src/slug.js'], expectedContextRevision: w.revision };
+    const first = await w.coding.prepare({ requestId: 'manual-first', ...form });
+    assert.deepEqual((await w.store.read()).requests[first.requestId].provenance, { unverifiedPaths: [], outcomeIntact: true });
+    const changed = 'Do something else.\nApproved context: ' + SUFFICIENT_REQUEST;
+    const edited = await w.coding.prepare({ requestId: 'manual-edited', supersedes: first.requestId, ...form, objective: changed });
+    const after = await w.store.read();
+    assert.deepEqual(after.requests[edited.requestId].provenance, { unverifiedPaths: [], outcomeIntact: false });
+    assert.equal(after.requests[first.requestId].status, 'superseded');
+    await assert.rejects(w.coding.approveAndDispatch(first), /CODING_APPROVAL_MISMATCH/);
+    assert.equal(w.calls.sends.length, 0); assert.equal(w.calls.judge, 1);
+    await w.coding.approveAndDispatch(edited);
+    assert.equal(w.calls.sends.length, 1);
+    assert.equal(JSON.parse(w.calls.sends[0].text).objective, changed, 'dispatch uses the exact edited review');
+  }
+});
+
+test('an assignment without a linked original request does not claim outcome preservation', async t => {
+  const w = await world(t);
+  const review = await w.coding.prepare({ requestId: 'unlinked-manual', objective: SUFFICIENT_REQUEST,
+    acceptance: 'Existing tests pass.', allowedPaths: ['src/slug.js'], expectedContextRevision: w.revision });
+  assert.deepEqual((await w.store.read()).requests[review.requestId].provenance, { unverifiedPaths: [] });
+  assert.equal(w.calls.judge, 0); assert.equal(w.calls.sends.length, 0);
 });
 
 test('a file mentioned only in derived project progress is not approved brief scope', async t => {

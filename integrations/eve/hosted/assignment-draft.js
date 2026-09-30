@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { outcomePreserved } from '../shared/assignment-outcome.js';
+import { assignmentOutcome, outcomePreserved } from '../shared/assignment-outcome.js';
 /**
  * Validation and composition for Eve's optional assignment draft.
  *
@@ -107,8 +107,10 @@ export function validateAssignmentDraft(draft, { project, approvedProject = proj
 export function assignmentProvenance({ objective, acceptance, allowedPaths }, project, source) {
   const unverifiedPaths = allowedPaths.filter(p => !pathEvidence(p, project));
   const draft = source?.assignmentDraft;
-  if (!draft) return { unverifiedPaths };
+  const outcome = assignmentOutcome(source);
+  const outcomeStatus = outcome === null ? {} : { outcomeIntact: outcomePreserved(objective, outcome) };
+  if (!draft) return { unverifiedPaths, ...outcomeStatus };
   const submitted = { objective, acceptance, allowedPaths: [...allowedPaths].sort() };
   return { unverifiedPaths, fromDraft: draft.draftHash, editedByOwner: hash(submitted) !== hash(draft.composed),
-    outcomeIntact: outcomePreserved(objective, draft.outcome) };
+    ...outcomeStatus };
 }
