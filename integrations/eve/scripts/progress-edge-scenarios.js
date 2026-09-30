@@ -116,3 +116,33 @@ export async function scenarioRecoveryStatusEdges({ fixture, page, kit, login })
   kit.pass('stalled-and-automatic-review-surfaces-agree-without-model-calls', fixture.modelCalls());
   return kit.assertions;
 }
+
+export async function scenarioTerminalFailure({ fixture, page, kit, login, screenshot }) {
+  const { reviewId } = await fixture.prepareHeldReview('unverified');
+  await fixture.store.change(s => {
+    const r = s.requests[reviewId]; delete r.purpose; r.mode = 'assignment_draft'; r.provider.sessionId = 'wrun_synthetic_terminal';
+  });
+  let reads = 0;
+  fixture.steward.observeSession = async ({ sessionId }) => {
+    reads++;
+    return { source: 'eve_session_stream', sessionId, terminalAt: (await fixture.store.read()).requests[reviewId].completedAt,
+      code: 'MODEL_SELECTION_FAILED', reason: 'JUDGE_STEP_LIMIT', eventCount: 8 };
+  };
+  const before = await fixture.store.read(); const calls = JSON.stringify(fixture.modelCalls());
+  await login(page, fixture);
+  await page.getByRole('button', { name: 'Check existing Eve session', exact: true }).click();
+  await page.getByText('Confirmed terminal judgment failure', { exact: true }).waitFor({ timeout: 20000 });
+  if (!/JUDGE_STEP_LIMIT/.test(await page.locator('[data-recovery-case="terminal_failure"]').innerText())) kit.fail('terminal-diagnostic-missing', 'expected allowlisted diagnostic');
+  await page.getByRole('button', { name: 'Acknowledge failed judgment', exact: true }).click();
+  await page.getByText('Failed judgment acknowledged · history kept', { exact: true }).waitFor({ timeout: 20000 });
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await page.getByText('Failed judgment acknowledged · history kept', { exact: true }).waitFor({ timeout: 20000 });
+  const after = await fixture.store.read();
+  if (reads !== 2 || JSON.stringify(fixture.modelCalls()) !== calls) kit.fail('terminal-recovery-called-model', 'unexpected model call or missing recheck');
+  if (JSON.stringify(before.requests[reviewId].provider) !== JSON.stringify(after.requests[reviewId].provider)
+    || before.requests[reviewId].message !== after.requests[reviewId].message || before.reservedMicros !== after.reservedMicros) kit.fail('terminal-recovery-lost-history', 'changed input/receipt/reservation');
+  if (!/start a fresh request/.test(await page.locator('p.summary').innerText())) kit.fail('terminal-recovery-next-step', 'wrong summary');
+  await screenshot(page);
+  kit.pass('terminal-failure-observed-rechecked-and-retained', { reads, historyRetained: true, noModelCall: true });
+  return kit.assertions;
+}

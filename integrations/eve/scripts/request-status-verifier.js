@@ -14,7 +14,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawn, execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
 import { chromium } from 'playwright';
-import { scenarioLostSubmission, scenarioRecoveryStatusEdges } from './progress-edge-scenarios.js';
+import { scenarioLostSubmission, scenarioRecoveryStatusEdges, scenarioTerminalFailure } from './progress-edge-scenarios.js';
 import {
   startRequestStatusFixture,
   PROPOSAL_OK,
@@ -652,6 +652,9 @@ async function runOnce({ evidenceDir, netnsReported, netnsAvailable }) {
     body: args => scenarioLostSubmission({ ...args, kit: assertionKit(), login }) });
   await runScenario({ ...shared, name: 'progress-recovery-status-edges', failureShot: '15-failure.png',
     body: args => scenarioRecoveryStatusEdges({ ...args, kit: assertionKit(), login }) });
+
+  await runScenario({ ...shared, name: 'terminal-judgment-recovery', failureShot: '16-failure.png',
+    body: args => scenarioTerminalFailure({ ...args, kit: assertionKit(), login, screenshot: page => page.screenshot({ path: join(evidenceDir, '16-terminal-recovered.png'), fullPage: true }) }) });
 
   // Assignment drafting scenarios — one fresh fixture each, synthetic coding connection.
   for (const scenario of ASSIGNMENT_SCENARIOS) {

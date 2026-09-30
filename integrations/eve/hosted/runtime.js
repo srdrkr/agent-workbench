@@ -6,6 +6,7 @@ import { HostedSteward } from './steward.js';
 import { hostedHandler } from './http.js';
 import { HostedCoding, codingConfig } from './coding.js';
 import { createEveJudge } from '../judge.js';
+import { createSessionObserver } from './session-observer.js';
 let runtime;
 export async function getHostedRuntime() {
   runtime ??= (async () => {
@@ -17,7 +18,9 @@ export async function getHostedRuntime() {
     const judge = await createEveJudge({ enabled: process.env.WORKBENCH_EVE_MODE === 'hosted', hosted: true,
       host: process.env.WORKBENCH_EVE_ORIGIN || origin, authToken: process.env.WORKBENCH_EVE_ACCESS_TOKEN, timeoutMs: 60_000 });
     const coding = new HostedCoding(store, { config: codingConfig() });
-    const steward = new HostedSteward(store, judge, { coding });
+    const observeSession = createSessionObserver({ enabled: process.env.WORKBENCH_EVE_MODE === 'hosted',
+      host: process.env.WORKBENCH_EVE_ORIGIN || origin, authToken: process.env.WORKBENCH_EVE_ACCESS_TOKEN });
+    const steward = new HostedSteward(store, judge, { coding, observeSession });
     const followThrough = process.env.WORKBENCH_FOLLOW_THROUGH_ENABLED === 'yes' ? new FollowThrough({ store, coding,
       review: createCodeReview({ store, read: coding.read, judge: await createEveJudge({ enabled: process.env.WORKBENCH_EVE_MODE === 'hosted', hosted: true, review: true,
         host: process.env.WORKBENCH_EVE_ORIGIN || origin, authToken: process.env.WORKBENCH_EVE_ACCESS_TOKEN, timeoutMs: 60_000 }) }),
