@@ -135,9 +135,10 @@ const currentState = computed(() => (view.value ? ownerState(view.value).key : '
 // Coding connection readiness from the server's read-only status: no spec, token or Routine identity is available here.
 const codingConnection = computed(() => {
   const connection = state.value?.codingConnection; const expiry = connection?.verifiedUntil ? new Date(connection.verifiedUntil).toLocaleString() : '';
-  if (connection?.status === 'ready') return { status: 'ready', warning: false, label: 'Coding ready', detail: `Coding connection verified until ${expiry}. Ask the operator to re-verify it before then so coding assignments stay available.` };
-  if (connection?.status === 'expired') return { status: 'expired', warning: true, label: 'Coding verification expired', detail: `Coding verification expired ${expiry}. Coding assignments cannot be approved or started until the operator re-verifies the coding connection.` };
-  return { status: 'not_configured', warning: false, label: 'Coding not connected', detail: 'No coding connection is configured. Ask the operator to configure and verify one before handing off coding work.' };
+  if (connection?.status === 'ready') return { status: 'ready', warning: false, label: 'Coding connection verified', detail: `Connection verified until ${expiry}. Ask the operator to re-verify it before then. Each coding task still needs scope approval.` };
+  if (connection?.status === 'expired') return { status: 'expired', warning: true, label: 'Coding verification expired', detail: `${expiry ? `Coding verification expired ${expiry}.` : 'Coding verification is invalid or expired.'} Coding assignments cannot be approved or started until the operator re-verifies the coding connection.` };
+  if (connection?.status === 'not_configured') return { status: 'not_configured', warning: false, label: 'Coding not connected', detail: 'No coding connection is configured. Ask the operator to configure and verify one before handing off coding work.' };
+  return { status: 'unknown', warning: false, label: 'Coding connection status unavailable', detail: 'Refresh status to check the coding connection verification. The latest assignment review still controls whether work can start.' };
 });
 const inFlight = computed(() => view.value?.requests.find(r => r.status === 'thinking' && !requestStalled(r, view.value.observedAt)) ?? null);
 const stalled = computed(() => view.value?.requests.find(r => requestStalled(r, view.value.observedAt)) ?? null);
