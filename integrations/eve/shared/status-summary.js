@@ -43,6 +43,7 @@ const UNMERGED = ['tested_draft_pr', 'needs_review', 'branch_without_pr', 'confl
 // Outcome-1 follow-up: a held record may carry the server's recovery classification
 // (hosted/recovery.js). Only its case, action and who-acts fields are used here.
 const HELD_CASE = {
+  terminal_failure: 'Eve judgment ended without a completed result',
   confirmed_rejection: 'provider refused a held attempt',
   expired_authority: 'provider refused a held attempt; its authority expired',
   allowance_exhausted: 'provider refused a held attempt; allowance exhausted',
@@ -53,6 +54,8 @@ const HELD_CASE = {
 function heldNext(held) {
   const r = held.recovery;
   if (!r) return 'review the held attempt';
+  if (r.case === 'terminal_failure' && r.action === 'acknowledge') return 'acknowledge the failed judgment in the web app';
+  if (r.action === 'observe') return 'check the existing Eve session in the web app; do not resend';
   if (r.action === 'acknowledge') return held.purpose === 'coding_review' ? 'acknowledge the failed review in the web app' : 'acknowledge the refused request in the web app';
   if (held.retryReviewHash && r.canRetry) return 'use the offered one-time retry in the web app';
   if (r.case === 'uncertain_delivery') return 'operator: check provider usage for the held attempt; do not resend';
@@ -97,7 +100,7 @@ function facts(view, options = {}) {
     v, job, held, thinking, stalled, unknownSubmission, jobOpen, failedStart,
     needsContext: newest?.status === 'needs_context' ? newest : null,
     notSent: newest?.status === 'not_sent' ? newest : null,
-    acknowledged: newest?.status === 'rejection_acknowledged' ? newest : null,
+    acknowledged: ['rejection_acknowledged', 'failure_acknowledged'].includes(newest?.status) ? newest : null,
     startUnconfirmed: jobOpen && dispatch !== 'accepted' && !['running', 'exited', 'stopped'].includes(execution),
     running: jobOpen && execution === 'running',
     ended: jobOpen && ['exited', 'stopped'].includes(execution),

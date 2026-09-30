@@ -71,6 +71,67 @@ export async function observeSchemaRejection(store, input, now) {
   });
 }
 
+// Limited to ordinary held requests, including drafting. Coding reviews and retry
+// chains retain their existing recovery policy. Server observation cannot approve output.
+function terminalRecoveryHash(state, record) {
+  const p = record?.provider;
+  if (record?.status !== 'held' || record.purpose !== undefined || record.retryOf || record.retryRequestId || record.proposal
+    || ![undefined, 'assignment_draft'].includes(record.mode) || record.projectId !== state.project.id
+    || !Number.isFinite(Date.parse(record.completedAt)) || !Number.isFinite(Date.parse(p?.intentAt))
+    || !/^wrun_[A-Za-z0-9_]{8,100}$/.test(p?.sessionId ?? '') || !(p.reservedMicros > 0)
+    || state.reservedMicros < p.reservedMicros || !(p.httpStatus >= 200 && p.httpStatus < 300)) return null;
+  return hash({ record, projectId: state.project.id });
+}
+export const terminalObservationHash = (state, record) => record?.terminalObservation ? null : terminalRecoveryHash(state, record);
+const terminalReceipt = (record, receipt, now) => receipt?.source === 'eve_session_stream'
+  && receipt.sessionId === record.provider.sessionId && receipt.code === 'MODEL_SELECTION_FAILED'
+  && receipt.reason === 'JUDGE_STEP_LIMIT' && receipt.eventCount === 8
+  && Number.isFinite(Date.parse(receipt.terminalAt)) && Date.parse(receipt.terminalAt) >= Date.parse(record.provider.intentAt)
+  && Date.parse(receipt.terminalAt) <= Date.parse(now);
+
+export async function observeTerminalFailure(store, observe, input, now) {
+  const { requestId, observationHash } = input ?? {};
+  need(typeof requestId === 'string' && typeof observationHash === 'string' && /^[a-f0-9]{64}$/.test(observationHash), 'INVALID_REQUEST');
+  const state = await store.read(); const record = own(state.requests, requestId);
+  need(observe, 'RECOVERY_NOT_SUPPORTED');
+  need(terminalObservationHash(state, record) === observationHash, 'RECOVERY_REVIEW_STALE');
+  const receipt = await observe({ requestId, sessionId: record.provider.sessionId });
+  need(terminalReceipt(record, receipt, now), 'RECOVERY_EVIDENCE_UNAVAILABLE');
+  return store.change(current => {
+    const r = own(current.requests, requestId);
+    need(terminalObservationHash(current, r) === observationHash, 'RECOVERY_REVIEW_STALE');
+    r.terminalObservation = { ...receipt, observedAt: now };
+    current.events.push({ seq: current.events.length + 1, kind: 'terminal_judgment_failure_observed', at: now,
+      data: { requestId, observation: r.terminalObservation } });
+    return r;
+  });
+}
+
+export async function acknowledgeTerminalFailure(store, observe, input, now) {
+  const { requestId, acknowledgeHash } = input ?? {};
+  need(typeof requestId === 'string' && typeof acknowledgeHash === 'string' && /^[a-f0-9]{64}$/.test(acknowledgeHash), 'INVALID_REQUEST');
+  const state = await store.read(); const r = own(state.requests, requestId);
+  if (r?.status === 'failure_acknowledged' && r.resolution?.acknowledgeHash === acknowledgeHash) return r;
+  need(observe, 'RECOVERY_NOT_SUPPORTED');
+  need(heldRecovery(state, r, now)?.acknowledgeHash === acknowledgeHash
+    && terminalRecoveryHash(state, r), 'RECOVERY_REVIEW_STALE');
+  // Recheck the current durable tail at acknowledgement. A resumed/changed session
+  // revokes recovery instead of relying on a historical terminal observation.
+  const receipt = await observe({ requestId, sessionId: r.provider.sessionId });
+  need(terminalReceipt(r, receipt, now) && Object.entries(receipt).every(([k, v]) => r.terminalObservation[k] === v), 'RECOVERY_EVIDENCE_UNAVAILABLE');
+  return store.change(current => {
+    const record = own(current.requests, requestId);
+    if (record?.status === 'failure_acknowledged' && record.resolution?.acknowledgeHash === acknowledgeHash) return record;
+    const recovery = heldRecovery(current, record, now);
+    need(recovery?.case === 'terminal_failure' && recovery.acknowledgeHash === acknowledgeHash, 'RECOVERY_REVIEW_STALE');
+    record.status = 'failure_acknowledged';
+    record.resolution = { kind: 'owner_acknowledged_terminal_failure', at: now, acknowledgeHash, case: recovery.case, heldEvidence: recovery.evidence };
+    current.events.push({ seq: current.events.length + 1, kind: 'held_terminal_failure_acknowledged', at: now,
+      data: { requestId, acknowledgeHash, retainedReservationMicros: record.provider.reservedMicros, totalReservedMicros: current.reservedMicros } });
+    return record;
+  });
+}
+
 function observedSchemaRefusal(record) {
   const o = record.rejectionObservation; const p = record.provider;
   return record.purpose === 'coding_review' && o?.source === 'owner_provider_ui' && o.reason === 'unsupported_tool_schema'
@@ -97,7 +158,7 @@ function authorityProblem(state, record, task, now) {
 }
 
 /** Returns an owner-facing handoff for a held record, or null for any other status. */
-export function heldRecovery(state, record, now) {
+export function heldRecovery(state, record, now, { canObserve = true } = {}) {
   if (record?.status !== 'held') return null;
   const e = evidenceOf(record); const p = record.provider;
   const coding = record.purpose === 'coding_review';
@@ -134,11 +195,20 @@ export function heldRecovery(state, record, now) {
     unknown: 'Whether the provider received, executed or billed the request, and what it returned.', whoActs: 'Operator with provider-account access',
     missing: 'A provider response or a provider usage record for this session. Steward cannot read provider usage (missing capability: session reconciliation).',
     nextStep: `Keep this held and do not retry. Check provider or gateway usage for session ${e.sessionId} around ${e.intentAt} (UTC). ${reserved}` });
-  if (e.httpStatus >= 200 && e.httpStatus < 300) return blocked('unverified_output', {
+  const observationHash = terminalObservationHash(state, record);
+  const terminalHash = terminalRecoveryHash(state, record);
+  if (canObserve && terminalHash && terminalReceipt(record, record.terminalObservation, now)) return {
+    ...base, case: 'terminal_failure', action: 'acknowledge',
+    evidence: { ...e, terminalObservation: record.terminalObservation }, acknowledgeHash: terminalHash,
+    whatHappened: 'The authenticated Eve session ended with MODEL_SELECTION_FAILED / JUDGE_STEP_LIMIT after its first model response. No completed result was recorded.',
+    unknown: `The invalid-output reason is not available. The response may have incurred provider charges. ${reserved}`,
+    whoActs: 'You (the owner)', missing: null,
+    nextStep: 'Acknowledge the failed judgment. Steward rechecks the existing session, keeps the input and reservation, and sends no model request. Any fresh coding work needs its own exact scope approval.' };
+  if (e.httpStatus >= 200 && e.httpStatus < 300) return { ...blocked('unverified_output', {
     whatHappened: `The provider answered HTTP ${e.httpStatus} for ${what}, but Steward could not verify a valid result from it.`,
     unknown: 'Whether the model produced usable output. Raw output is not retained, so invalid output cannot be told apart from an interrupted response.',
     whoActs: 'Operator', missing: 'The validated model output or the validation failure reason; neither is stored.',
-    nextStep: `Keep this held. The request was processed, so a replay could duplicate work. The operator must inspect provider logs for session ${e.sessionId}. ${reserved}` });
+    nextStep: `Keep this held. The request was processed, so a replay could duplicate work. The operator must inspect provider logs for session ${e.sessionId}. ${reserved}` }), ...(canObserve && observationHash ? { action: 'observe', observationHash, nextStep: 'Check the existing Eve session for a confirmed terminal failure. This reads its saved events and makes no model call. Unknown, ongoing or completed results remain held.' } : {}) };
   const consistent = p.rejection?.httpStatus === e.httpStatus && (typeof e.errorCategory === 'string' || observedSchemaRefusal(record)) && Number.isFinite(Date.parse(record.completedAt));
   if (!consistent) return blocked('unclassified', {
     whatHappened: `The provider answered HTTP ${e.httpStatus} for ${what} without a recognized error body.`,
@@ -214,6 +284,7 @@ export async function acknowledgeRejectedReview(store, input, now) {
     const recovery = heldRecovery(state, record, now);
     need(recovery, 'RECOVERY_REVIEW_STALE');
     const refusedCases = ['confirmed_rejection', 'expired_authority', 'allowance_exhausted'];
+    need(refusedCases.includes(recovery.case), 'RECOVERY_NOT_SUPPORTED');
     need(recovery.acknowledgeHash === acknowledgeHash, recovery.action === 'acknowledge' ? 'RECOVERY_REVIEW_STALE'
       : refusedCases.includes(recovery.case) && recovery.taskStatus && !terminal.has(recovery.taskStatus) ? 'RECOVERY_TASK_ACTIVE' : 'RECOVERY_NOT_SUPPORTED');
     record.status = 'rejection_acknowledged';
