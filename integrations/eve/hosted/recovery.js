@@ -2,8 +2,8 @@ import { createHash } from 'node:crypto';
 import { attemptLimit } from './continuation.js';
 
 // Held-attempt recovery. Classification uses only facts Steward recorded itself:
-// the transport's intent/reservation, the HTTP status, and the category parsed from
-// the provider's error body. An HTTP status or model statement alone is never enough.
+// the transport's intent/reservation, the HTTP status, and parsed provider categories
+// or a separately recorded owner observation. Status or model prose alone is insufficient.
 const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const need = (ok, code) => { if (!ok) throw new Error(code); };
 const terminal = new Set(['blocked', 'finished']);
@@ -28,9 +28,59 @@ export function rejectionReviewHash(record) {
     judge: record.judge, completedAt: record.completedAt, provider: p });
 }
 
+// Operator observations stay separate from the original transport receipt.
+// This narrow path supports legacy schema refusals whose category was discarded.
+const cleanSchemaReceipt = p => p?.httpStatus === 400 && p.rejection?.httpStatus === 400
+  && p.rejection.errorCategory == null && !p.rejection.providerErrorCode
+  && !(p.rejection.providerErrors ?? []).some(e => e.provider !== 'anthropic' || e.statusCode !== 400 || e.category)
+  && /^gen_[A-Za-z0-9]{8,80}$/.test(p.rejection.gatewayGenerationId ?? '');
+
+export function rejectionObservationHash(state, record) {
+  const p = record?.provider;
+  const task = own(state.coding?.jobs, record?.taskId);
+  const entries = task?.followThrough?.reviews?.filter(r => r.id === record.id && r.headSha === record.headSha) ?? [];
+  if (record?.status !== 'held' || record.purpose !== 'coding_review' || record.rejectionObservation
+    || record.projectId !== state.project.id || task?.projectId !== state.project.id || task.id !== record.taskId
+    || !terminal.has(task.followThrough?.status) || !task.releasedAt
+    || entries.length !== 1 || !['intent', 'unknown'].includes(entries[0].status)
+    || !p?.intentAt || !p.sessionId || !(p.reservedMicros > 0) || !cleanSchemaReceipt(p)
+    || !Number.isFinite(Date.parse(record.completedAt))) return null;
+  return hash({ record, task, projectId: state.project.id });
+}
+
+export async function observeSchemaRejection(store, input, now) {
+  const { requestId, observationHash, generationId, observedAt, reason, providerStatus, source } = input ?? {};
+  need(typeof requestId === 'string' && requestId.length <= 128
+    && typeof observationHash === 'string' && /^[a-f0-9]{64}$/.test(observationHash)
+    && source === 'owner_provider_ui' && reason === 'unsupported_tool_schema' && providerStatus === 400
+    && typeof generationId === 'string' && /^gen_[A-Za-z0-9]{8,80}$/.test(generationId)
+    && typeof observedAt === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(observedAt)
+    && Number.isFinite(Date.parse(observedAt)) && new Date(observedAt).toISOString() === observedAt && Date.parse(observedAt) <= Date.parse(now), 'INVALID_REQUEST');
+  return store.change(state => {
+    const record = own(state.requests, requestId);
+    need(record, 'RECOVERY_REVIEW_STALE');
+    const observation = { source, reason, providerStatus, generationId, observedAt: new Date(observedAt).toISOString(), observationHash };
+    if (record.rejectionObservation && Object.entries(observation).every(([key, value]) => record.rejectionObservation[key] === value)) return record;
+    need(rejectionObservationHash(state, record) === observationHash
+      && generationId === record.provider.rejection.gatewayGenerationId
+      && Date.parse(observedAt) >= Date.parse(record.completedAt), 'RECOVERY_REVIEW_STALE');
+    record.rejectionObservation = observation;
+    state.events.push({ seq: state.events.length + 1, kind: 'schema_rejection_observed', at: now,
+      data: { requestId, taskId: record.taskId, observation } });
+    return record;
+  });
+}
+
+function observedSchemaRefusal(record) {
+  const o = record.rejectionObservation; const p = record.provider;
+  return record.purpose === 'coding_review' && o?.source === 'owner_provider_ui' && o.reason === 'unsupported_tool_schema'
+    && o.providerStatus === 400 && cleanSchemaReceipt(p)
+    && o.generationId === p.rejection.gatewayGenerationId;
+}
+
 function evidenceOf(record) {
   const p = record.provider; const r = p?.rejection;
-  return { intentAt: p?.intentAt ?? null, sessionId: p?.sessionId ?? null, reservedMicros: p?.reservedMicros ?? 0,
+  return { ...(observedSchemaRefusal(record) ? { observation: record.rejectionObservation } : {}), intentAt: p?.intentAt ?? null, sessionId: p?.sessionId ?? null, reservedMicros: p?.reservedMicros ?? 0,
     httpStatus: p?.httpStatus ?? null, errorCategory: r?.errorCategory ?? null, providerErrorCode: r?.providerErrorCode ?? null,
     requestIdentifier: r?.requestIdentifier?.value ?? null, completedAt: record.completedAt ?? null };
 }
@@ -69,6 +119,11 @@ export function heldRecovery(state, record, now) {
     ...(retryOffered ? { whoActs: 'You (the owner)', missing: null,
       nextStep: 'The existing proposal retry policy offers "Retry this request once". It resends this exact request once under the existing limits; this does not prove the previous attempt did no work.' } : {}) });
 
+  if (record.rejectionObservation && (!observedSchemaRefusal(record) || !task?.releasedAt)) return blocked('unclassified', {
+    whatHappened: 'The saved owner observation no longer matches a released task and consistent schema refusal.',
+    unknown: 'Whether the old observation still applies.', whoActs: 'Operator',
+    missing: 'A released task and provider diagnostics consistent with the observed refusal.',
+    nextStep: 'Keep this held. Reconcile the changed task or provider evidence before acknowledgement.' });
   if (!e.intentAt || !e.sessionId || !(e.reservedMicros > 0)) return blocked('unclassified', {
     whatHappened: `A held record exists for ${what}, but its send intent or reservation is incomplete.`,
     unknown: 'Whether a model request was sent at all.', whoActs: 'Operator',
@@ -84,7 +139,7 @@ export function heldRecovery(state, record, now) {
     unknown: 'Whether the model produced usable output. Raw output is not retained, so invalid output cannot be told apart from an interrupted response.',
     whoActs: 'Operator', missing: 'The validated model output or the validation failure reason; neither is stored.',
     nextStep: `Keep this held. The request was processed, so a replay could duplicate work. The operator must inspect provider logs for session ${e.sessionId}. ${reserved}` });
-  const consistent = p.rejection?.httpStatus === e.httpStatus && typeof e.errorCategory === 'string' && Number.isFinite(Date.parse(record.completedAt));
+  const consistent = p.rejection?.httpStatus === e.httpStatus && (typeof e.errorCategory === 'string' || observedSchemaRefusal(record)) && Number.isFinite(Date.parse(record.completedAt));
   if (!consistent) return blocked('unclassified', {
     whatHappened: `The provider answered HTTP ${e.httpStatus} for ${what} without a recognized error body.`,
     unknown: 'Whether the request was refused before execution. The status code alone does not prove it.', whoActs: 'Operator',
@@ -95,7 +150,7 @@ export function heldRecovery(state, record, now) {
     || (e.providerErrorCode === 'enforced_spend_limit_reached'
       && ((e.httpStatus === 400 && e.errorCategory === 'invalid_request_error')
         || (e.httpStatus === 429 && ['rate_limit_error', 'rate_limit_exceeded'].includes(e.errorCategory))));
-  const refused = (refusals[e.httpStatus] ?? []).includes(e.errorCategory);
+  const refused = observedSchemaRefusal(record) || (refusals[e.httpStatus] ?? []).includes(e.errorCategory);
   if (!refused) return blocked('unclassified', {
     whatHappened: `The provider answered HTTP ${e.httpStatus} (${e.errorCategory}) for ${what}.`,
     unknown: 'Whether any work was done before the failure. This category does not confirm a refusal before execution.', whoActs: 'Operator',
@@ -103,7 +158,7 @@ export function heldRecovery(state, record, now) {
     nextStep: `Keep this held. The operator must check provider logs for session ${e.sessionId}. ${reserved}` });
 
   const kind = providerLimit ? 'allowance_exhausted' : authority ? 'expired_authority' : localLimit ? 'allowance_exhausted' : 'confirmed_rejection';
-  const whatHappened = `The provider refused ${what}: HTTP ${e.httpStatus}, ${e.providerErrorCode ?? e.errorCategory}. No ${coding ? 'review result' : 'proposal'} was produced.${coding && task?.followThrough?.reason ? ` The task's follow-through stopped: ${task.followThrough.reason}` : ''}`;
+  const whatHappened = `${observedSchemaRefusal(record) ? 'The owner observed this schema refusal in the provider UI. ' : ''}The provider refused ${what}: HTTP ${e.httpStatus}, ${observedSchemaRefusal(record) ? 'owner-observed unsupported tool schema' : e.providerErrorCode ?? e.errorCategory}. No ${coding ? 'review result' : 'proposal'} was produced.${coding && task?.followThrough?.reason ? ` The task's follow-through stopped: ${task.followThrough.reason}` : ''}`;
   const unknown = `Steward cannot read provider billing for this refusal. ${reserved}${coding ? ' The pull request itself is still unreviewed.' : ''}`;
   const after = kind === 'allowance_exhausted'
     ? (providerLimit ? 'The provider account spend limit refused it; only the account owner can change that, outside Steward. Steward will not refill or retry.' : 'Your pilot allowance is used up. Review the pilot allowance before any new request.')
@@ -133,7 +188,7 @@ export function heldRecovery(state, record, now) {
     missing: 'The task follow-through has not stopped yet.', nextStep: 'Wait for the next follow-through check to stop this task, then refresh. Acknowledgement is offered only after the task has stopped.' });
   const acknowledgeHash = hash({ id: record.id, purpose: record.purpose, taskId: record.taskId, headSha: record.headSha, inputHash: record.inputHash,
     projectId: record.projectId, taskProjectId: task.projectId, review,
-    contextRevision: record.contextRevision, judge: record.judge, completedAt: record.completedAt, provider: p, case: kind, taskStatus: task.followThrough.status });
+    contextRevision: record.contextRevision, judge: record.judge, completedAt: record.completedAt, provider: p, observation: record.rejectionObservation ?? null, case: kind, taskStatus: task.followThrough.status });
   return { ...base, case: kind, action: 'acknowledge', acknowledgeHash, whatHappened, unknown, whoActs: 'You (the owner)', missing: null,
     nextStep: `Acknowledge this failed review. That keeps its history and reservation, sends nothing and does not retry or resume the task. ${after}` };
 }

@@ -400,3 +400,124 @@ test('summary does not offer a retry when the recovery handoff names the operato
   assert.match(statusSummary(view), /Next: operator:/);
   assert.doesNotMatch(statusSummary(view), /Next: .*retry/);
 });
+
+test('legacy schema rejection needs an exact owner provider observation, retains the receipt and allowance, then permits acknowledgement', async t => {
+  const f = await fixture(t); const { reviewId } = await held(f, 'status_only');
+  await f.store.change(s => { s.requests[reviewId].provider.rejection.gatewayGenerationId = 'gen_SyntheticSchema12345678'; });
+  const record = (await f.steward.view()).requests.find(r => r.id === reviewId);
+  assert.equal(record.recovery.action, 'none'); assert.ok(record.rejectionObservationHash);
+  const before = await f.store.read(); const calls = sent(f);
+  const input = { requestId: reviewId, observationHash: record.rejectionObservationHash,
+    generationId: 'gen_SyntheticSchema12345678', observedAt: f.now(), providerStatus: 400,
+    source: 'owner_provider_ui', reason: 'unsupported_tool_schema' };
+  for (const wrong of [
+    { generationId: 'gen_DifferentSchema12345678' }, { observationHash: 'f'.repeat(64) },
+    { observedAt: '2026-09-24T13:00:00.000Z' }, { observedAt: '2026-09-23T12:00:00.000Z' },
+    { source: 'worker_self_report' }, { reason: 'zero_cost' }, { providerStatus: 200 },
+  ]) {
+    await assert.rejects(f.steward.observeSchemaRejection({ ...input, ...wrong }), /INVALID_REQUEST|RECOVERY_REVIEW_STALE/);
+    assert.deepEqual(await f.store.read(), before);
+  }
+  const observed = await f.steward.observeSchemaRejection(input);
+  assert.deepEqual(await f.steward.observeSchemaRejection(input), observed);
+  const current = (await f.steward.view()).requests.find(r => r.id === reviewId);
+  assert.equal(current.rejectionObservationHash, null); assert.equal(current.recovery.action, 'acknowledge');
+  assert.match(current.recovery.whatHappened, /owner observed/); assert.equal(current.provider.rejection.errorCategory, null);
+  assert.equal(current.recovery.evidence.observation.source, 'owner_provider_ui');
+  assert.equal(current.recovery.evidence.errorCategory, null);
+  assert.doesNotMatch(current.recovery.whatHappened, /invalid_request_error/);
+  await f.steward.acknowledgeRejectedReview({ requestId: reviewId, acknowledgeHash: current.recovery.acknowledgeHash });
+  const after = await f.store.read();
+  assert.deepEqual(after.requests[reviewId].provider, before.requests[reviewId].provider);
+  assert.deepEqual(after.coding, before.coding); assert.equal(after.reservedMicros, before.reservedMicros);
+  assert.equal(after.maxProviderAttempts, before.maxProviderAttempts); assert.equal(after.budgetMicros, before.budgetMicros);
+  assert.equal(after.events.filter(e => e.kind === 'schema_rejection_observed').length, 1); assert.equal(sent(f), calls);
+  await assert.rejects(f.steward.observeSchemaRejection({ ...input, observedAt: '2026-09-24T12:00:01.000Z' }), /INVALID_REQUEST/);
+  assert.equal((await f.steward.propose(ask('fresh-after-schema-ack'))).status, 'awaiting_approval');
+});
+
+test('legacy observation cannot resolve unknown delivery, successful unverified output, unrelated projects or unreleased tasks', async t => {
+  const f = await fixture(t); const { reviewId } = await held(f, 'status_only');
+  await f.store.change(s => { s.requests[reviewId].provider.rejection.gatewayGenerationId = 'gen_SyntheticSchema12345678'; });
+  const { rejectionObservationHash } = await import('../hosted/recovery.js');
+  const original = await f.store.read();
+  const input = { requestId: reviewId, observationHash: rejectionObservationHash(original, original.requests[reviewId]),
+    generationId: 'gen_SyntheticSchema12345678', observedAt: f.now(), providerStatus: 400,
+    source: 'owner_provider_ui', reason: 'unsupported_tool_schema' };
+  for (const damage of [
+    s => { delete s.requests[reviewId].provider.httpStatus; },
+    s => { s.requests[reviewId].provider.httpStatus = 200; },
+    s => { delete s.requests[reviewId].provider.rejection.gatewayGenerationId; },
+    s => { s.requests[reviewId].projectId = 'another-project'; },
+    s => { delete s.requests[reviewId].purpose; },
+    s => { s.requests[reviewId].provider.rejection.errorCategory = 'invalid_request_error'; },
+    s => { s.requests[reviewId].provider.httpStatus = s.requests[reviewId].provider.rejection.httpStatus = 401; },
+    s => { s.requests[reviewId].provider.rejection.httpStatus = 503; },
+    s => { s.requests[reviewId].provider.rejection.providerErrorCode = 'enforced_spend_limit_reached'; },
+    s => { s.requests[reviewId].provider.rejection.providerErrors = [{ provider: 'anthropic', statusCode: 503 }]; },
+    s => { s.coding.jobs['synthetic-task'].followThrough.reviews.push(structuredClone(s.coding.jobs['synthetic-task'].followThrough.reviews[0])); },
+    s => { delete s.coding.jobs['synthetic-task']; },
+    s => { delete s.coding.jobs['synthetic-task'].releasedAt; },
+    s => { s.coding.jobs['synthetic-task'].followThrough.status = 'waiting_for_pr'; },
+    s => { s.coding.jobs['synthetic-task'].followThrough.reviews[0].headSha = 'b'.repeat(40); },
+  ]) {
+    const changed = structuredClone(original); damage(changed);
+    assert.equal(rejectionObservationHash(changed, changed.requests[reviewId]), null);
+    await f.store.change(s => { Object.assign(s, changed); });
+    await assert.rejects(f.steward.observeSchemaRejection(input), /RECOVERY_REVIEW_STALE/);
+    assert.deepEqual(await f.store.read(), changed);
+  }
+});
+
+test('schema observation API requires owner auth and exact origin', async t => {
+  const pool = new TestPool(); t.after(() => pool.end());
+  const secret = 'local-test-secret-at-least-thirty-two-characters'; const password = 'synthetic-local-test-password';
+  await setupHosted(pool, { origin, secret, ownerEmail, password, project, budgetMicros: 1_000_000 });
+  const f = await fixture(t, { pool }); const { reviewId } = await held(f, 'status_only');
+  await f.store.change(s => { s.requests[reviewId].provider.rejection.gatewayGenerationId = 'gen_SyntheticSchema12345678'; });
+  const r = (await f.steward.view()).requests.find(r => r.id === reviewId);
+  const body = { requestId: reviewId, observationHash: r.rejectionObservationHash,
+    generationId: 'gen_SyntheticSchema12345678', observedAt: f.now(), providerStatus: 400,
+    source: 'owner_provider_ui', reason: 'unsupported_tool_schema' };
+  const handle = hostedHandler({ auth: ownerAuth(pool, { origin, secret }), steward: f.steward, ownerEmail, origin });
+  const req = (path, body, cookie, from = origin) => new Request(origin + path, { method: 'POST',
+    headers: { origin: from, 'content-type': 'application/json', ...(cookie ? { cookie } : {}) }, body: JSON.stringify(body) });
+  const route = '/api/steward/recovery/observe-schema-rejection';
+  assert.equal((await handle(req(route, body))).status, 401);
+  const login = await handle(req('/api/auth/sign-in/email', { email: ownerEmail, password }));
+  const cookie = login.headers.getSetCookie().map(v => v.split(';')[0]).join('; ');
+  assert.equal((await handle(req(route, body, cookie, 'https://evil.example'))).status, 403);
+  assert.equal((await handle(req(route, body, cookie))).status, 200);
+  assert.equal((await handle(req(route, body, cookie))).status, 200);
+  assert.equal((await f.store.read()).events.filter(e => e.kind === 'schema_rejection_observed').length, 1);
+});
+
+
+test('schema acknowledgement is revoked by contradictory evidence or a provider session running after release', async t => {
+  const f = await fixture(t); const { reviewId } = await held(f, 'status_only');
+  await f.store.change(s => { s.requests[reviewId].provider.rejection.gatewayGenerationId = 'gen_SyntheticSchema12345678'; });
+  const r = (await f.steward.view()).requests.find(r => r.id === reviewId);
+  await f.steward.observeSchemaRejection({ requestId: reviewId, observationHash: r.rejectionObservationHash,
+    generationId: 'gen_SyntheticSchema12345678', observedAt: f.now(), providerStatus: 400,
+    source: 'owner_provider_ui', reason: 'unsupported_tool_schema' });
+  const ready = (await f.steward.view()).requests.find(r => r.id === reviewId);
+  const original = await f.store.read();
+  for (const damage of [
+    s => { s.requests[reviewId].provider.rejection.errorCategory = 'invalid_request_error'; },
+    s => { s.requests[reviewId].provider.rejection.providerErrorCode = 'enforced_spend_limit_reached'; },
+    s => { s.requests[reviewId].provider.rejection.providerErrors = [{ provider: 'anthropic', statusCode: 503 }]; },
+    s => { delete s.coding.jobs['synthetic-task'].releasedAt; },
+  ]) {
+    const changed = structuredClone(original); damage(changed);
+    await f.store.change(s => { Object.assign(s, changed); });
+    assert.equal((await f.steward.view()).requests.find(r => r.id === reviewId).recovery.action, 'none');
+    await assert.rejects(f.steward.acknowledgeRejectedReview({ requestId: reviewId, acknowledgeHash: ready.recovery.acknowledgeHash }), /RECOVERY_NOT_SUPPORTED/);
+    assert.deepEqual(await f.store.read(), changed);
+  }
+  await f.store.change(s => { Object.assign(s, original); }); f.advance(1000);
+  const { HostedCoding } = await import('../hosted/coding.js');
+  await new HostedCoding(f.store, { now: f.now }).observe({ requestId: 'synthetic-task', execution: 'running',
+    sessionId: 'session_SyntheticRunning', sessionUrl: 'https://claude.ai/code/session_SyntheticRunning', observedAt: f.now(), markerVerified: true });
+  assert.equal((await f.steward.view()).requests.find(r => r.id === reviewId).recovery.action, 'none');
+  await assert.rejects(f.steward.acknowledgeRejectedReview({ requestId: reviewId, acknowledgeHash: ready.recovery.acknowledgeHash }), /RECOVERY_NOT_SUPPORTED/);
+});

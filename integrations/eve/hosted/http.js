@@ -37,6 +37,7 @@ export function hostedHandler({ auth, steward, ownerEmail, origin }) {
         if (!steward.coding) throw new Error('CODING_NOT_ENABLED');
         return reply(await steward.coding[codingActions[path]](input));
       }
+      if (path === '/api/steward/recovery/observe-schema-rejection') return reply(await steward.observeSchemaRejection(input));
       if (path === '/api/steward/recovery/acknowledge') return reply(await steward.acknowledgeRejectedReview(input));
       if (path === '/api/steward/propose') return reply(await steward.propose(input));
       if (path === '/api/steward/approve') return reply(await steward.approve(input));
