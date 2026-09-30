@@ -13,6 +13,10 @@ export const fresh = (project, now) => project.sources.every(s => Date.parse(s.o
 const validId = value => typeof value === 'string' && /^[a-z0-9][a-z0-9-]{0,63}$/.test(value);
 const requireValue = (condition, message) => { if (!condition) throw new Error(message); };
 const event = (state, kind, data, at) => state.events.push({ seq: state.events.length + 1, kind, data, at });
+// Owner-visible coding connection readiness: status and verified-until only. The spec, trigger token, GitHub token and Routine identity never leave the server.
+const codingConnectionView = coding => coding?.config
+  ? { status: coding.enabled() ? 'ready' : 'expired', verifiedUntil: new Date(Date.parse(coding.config.verifiedUntil)).toISOString() }
+  : { status: 'not_configured', verifiedUntil: null };
 
 export function initialState(project, { model, budgetMicros }) {
   validateProject(project);
@@ -52,7 +56,7 @@ export class HostedSteward {
       historicalCommitments: Object.values(state.commitments).filter(c => c.contextRevision !== state.project.revision),
       providerAttempts: Object.values(state.requests).filter(r => r.provider).length, maxProviderAttempts: attemptLimit(state),
       budgetMicros: state.budgetMicros, reservedMicros: state.reservedMicros, paused: state.paused,
-      codingEnabled: Boolean(this.coding?.enabled()), codingJobs: Object.values(state.coding?.jobs ?? {}), codingPaused: Boolean(state.coding?.paused) };
+      codingEnabled: Boolean(this.coding?.enabled()), codingConnection: codingConnectionView(this.coding), codingJobs: Object.values(state.coding?.jobs ?? {}), codingPaused: Boolean(state.coding?.paused) };
   }
   async propose({ requestId, projectId, message, expectedContextRevision, retryOf, rejectionHash, mode }) {
     requireValue(validId(requestId) && typeof projectId === 'string' && typeof message === 'string' && message.trim() && message.length <= 2000

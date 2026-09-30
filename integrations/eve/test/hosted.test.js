@@ -10,6 +10,7 @@ import { hostedTransport, HOSTED_MODEL } from '../hosted/transport.js';
 import { ownerAuth } from '../hosted/auth.js';
 import { hostedHandler } from '../hosted/http.js';
 import { setupHosted } from '../hosted/setup.js';
+import { HostedCoding } from '../hosted/coding.js';
 const project = JSON.parse(await readFile(new URL('../../../fixtures/steward-project.json', import.meta.url)));
 const ownerEmail = 'owner@example.com'; const origin = 'http://localhost:4399';
 const secret = 'local-test-secret-at-least-thirty-two-characters';
@@ -258,4 +259,30 @@ test('a rejected recovery remains held and cannot chain or trigger automatic att
   const child = (await steward.view()).requests.find(r => r.id === 'retry-one');
   await assert.rejects(steward.propose({ ...f.recovery, requestId: 'retry-again', retryOf: child.id, rejectionHash: child.retryReviewHash }), /UNRESOLVED_MODEL_ATTEMPT/);
   assert.equal(sends, 1);
+});
+
+test('status view exposes only coding connection readiness and expiry, without secrets or model/provider calls', async t => {
+  let calls = 0; const forbidden = async () => { calls++; throw new Error('UNEXPECTED_CALL'); };
+  const { store } = await fixture(t, forbidden);
+  const token = 'synthetic-trigger-secret-for-local-tests'; const githubToken = 'synthetic-read-token';
+  const spec = { ...project.codingCandidates[0].spec, taskId: 'connection-only-task', routineId: 'trig_CONNECTION_ONLY', objective: 'Connection-only objective never shown.', mode: 'live' };
+  const build = verifiedUntil => {
+    const coding = verifiedUntil === null ? null : new HostedCoding(store, { config: { spec, verifiedUntil, token, githubToken, repeatable: true }, send: forbidden, read: forbidden, now });
+    return { coding, steward: new HostedSteward(store, forbidden, { now, coding }) };
+  };
+  const absent = build(null); const ready = build('2026-09-20T12:00:00.000Z'); const expired = build('2026-09-19T11:59:59.000Z');
+  const views = { absent: await absent.steward.view(), ready: await ready.steward.view(), expired: await expired.steward.view() };
+  assert.deepEqual(views.absent.codingConnection, { status: 'not_configured', verifiedUntil: null }); assert.equal(views.absent.codingEnabled, false);
+  assert.deepEqual(views.ready.codingConnection, { status: 'ready', verifiedUntil: '2026-09-20T12:00:00.000Z' }); assert.equal(views.ready.codingEnabled, true);
+  assert.deepEqual(views.expired.codingConnection, { status: 'expired', verifiedUntil: '2026-09-19T11:59:59.000Z' }); assert.equal(views.expired.codingEnabled, false);
+  for (const view of Object.values(views)) {
+    assert.deepEqual(Object.keys(view.codingConnection).sort(), ['status', 'verifiedUntil']);
+    const serialized = JSON.stringify(view);
+    for (const leak of [token, githubToken, spec.taskId, spec.routineId, spec.objective]) assert.ok(!serialized.includes(leak), `status view must not expose ${leak}`);
+  }
+  // Admission is unchanged: an expired connection still fails closed before any store, model or provider work.
+  await assert.rejects(expired.coding.review({ requestId: 'request-one', proposalHash: 'a'.repeat(64) }), /CODING_NOT_ENABLED/);
+  await assert.rejects(expired.coding.prepare({ requestId: 'request-one', objective: 'x', acceptance: 'y', allowedPaths: ['a.js'] }), /CODING_NOT_ENABLED/);
+  await assert.rejects(ready.coding.review({ requestId: 'request-one', proposalHash: 'a'.repeat(64) }), /CODING_APPROVAL_MISMATCH/);
+  assert.equal(calls, 0);
 });
