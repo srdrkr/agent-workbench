@@ -189,7 +189,7 @@ test('provider spend limit and local allowance exhaustion are shown as allowance
   assert.equal((await local.steward.propose(ask('after-new-allowance'))).status, 'awaiting_approval');
 });
 
-test('a refused proposal keeps the existing one-time retry and has no acknowledgement', async t => {
+test('a retryable refused proposal keeps its existing one-time retry and non-retryable refusals can be acknowledged', async t => {
   const pool = new TestPool(); t.after(() => pool.end()); await pool.query(stateSchema);
   const now = () => '2026-09-24T12:00:00.000Z';
   const store = new HostedStore(pool, { ownerId: ownerEmail, projectId: project.id });
@@ -208,6 +208,8 @@ test('a refused proposal keeps the existing one-time retry and has no acknowledg
   await store.change(s => { s.requests[record.id].retryRequestId = 'already-retried'; });
   let shown = (await steward.view()).requests[0];
   assert.equal(shown.retryReviewHash, null); assert.equal(shown.recovery.whoActs, 'Operator');
+  assert.equal(shown.recovery.action, 'none');
+  await assert.rejects(steward.acknowledgeRejectedReview({ requestId: record.id, acknowledgeHash: 'c'.repeat(64) }), /RECOVERY_NOT_SUPPORTED/);
   assert.doesNotMatch(shown.recovery.nextStep, /Retry this request once/);
   await store.change(s => {
     const r = s.requests[record.id]; delete r.retryRequestId;
@@ -215,8 +217,8 @@ test('a refused proposal keeps the existing one-time retry and has no acknowledg
     r.provider.rejection.errorCategory = 'invalid_request_error';
   });
   shown = (await steward.view()).requests[0];
-  assert.equal(shown.retryReviewHash, null); assert.equal(shown.recovery.whoActs, 'Operator');
-  assert.match(shown.recovery.missing, /no supported recovery/);
+  assert.equal(shown.retryReviewHash, null); assert.equal(shown.recovery.action, 'acknowledge');
+  assert.equal(shown.recovery.whoActs, 'You (the owner)');
   assert.doesNotMatch(shown.recovery.nextStep, /Retry this request once/);
   // The existing explicit proposal retry policy remains separate from coding acknowledgement.
   await store.change(s => {
@@ -520,4 +522,93 @@ test('schema acknowledgement is revoked by contradictory evidence or a provider 
     sessionId: 'session_SyntheticRunning', sessionUrl: 'https://claude.ai/code/session_SyntheticRunning', observedAt: f.now(), markerVerified: true });
   assert.equal((await f.steward.view()).requests.find(r => r.id === reviewId).recovery.action, 'none');
   await assert.rejects(f.steward.acknowledgeRejectedReview({ requestId: reviewId, acknowledgeHash: ready.recovery.acknowledgeHash }), /RECOVERY_NOT_SUPPORTED/);
+});
+
+
+test('confirmed non-retryable proposal refusal is acknowledged without lost input, replay or accounting changes', async t => {
+  const f = await fixture(t); const { reviewId } = await held(f, 'refused');
+  await f.store.change(s => {
+    const r = s.requests[reviewId]; delete r.purpose; delete r.taskId;
+    r.provider.httpStatus = r.provider.rejection.httpStatus = 401; r.provider.rejection.errorCategory = 'authentication_error';
+  });
+  const record = (await f.steward.view()).requests.find(r => r.id === reviewId);
+  assert.equal(record.recovery.action, 'acknowledge'); assert.match(record.recovery.whatHappened, /this request.*401/);
+  const before = await f.store.read(); const calls = sent(f);
+  const input = { requestId: reviewId, acknowledgeHash: record.recovery.acknowledgeHash };
+  const first = await f.steward.acknowledgeRejectedReview(input);
+  assert.deepEqual(await f.steward.acknowledgeRejectedReview(input), first);
+  const after = await f.store.read();
+  assert.equal(first.status, 'rejection_acknowledged'); assert.equal(first.message, before.requests[reviewId].message);
+  assert.deepEqual(first.provider, before.requests[reviewId].provider); assert.deepEqual(after.coding, before.coding);
+  assert.equal(after.reservedMicros, before.reservedMicros); assert.equal(after.budgetMicros, before.budgetMicros);
+  assert.equal(after.maxProviderAttempts, before.maxProviderAttempts); assert.equal(sent(f), calls);
+  assert.equal(after.events.filter(e => e.kind === 'held_rejection_acknowledged').length, 1);
+  await assert.rejects(f.steward.acknowledgeRejectedReview({ ...input, acknowledgeHash: 'f'.repeat(64) }), /RECOVERY_REVIEW_STALE/);
+});
+
+test('proposal acknowledgement preserves expired-brief and pause gates and rejects uncertain evidence', async t => {
+  const f = await fixture(t); const { reviewId } = await held(f, 'refused');
+  await f.store.change(s => { delete s.requests[reviewId].purpose; delete s.requests[reviewId].taskId; });
+  const original = await f.store.read();
+  for (const damage of [
+    s => { delete s.requests[reviewId].provider.httpStatus; },
+    s => { s.requests[reviewId].provider.httpStatus = 200; },
+    s => { s.requests[reviewId].provider.rejection.errorCategory = null; },
+    s => { s.requests[reviewId].projectId = 'another-project'; },
+    s => { s.requests[reviewId].purpose = 'unexpected'; },
+    s => { s.requests[reviewId].retryOf = 'original-request'; },
+    s => { s.requests[reviewId].retryRequestId = 'linked-request'; s.requests['linked-request'] = { id: 'linked-request', status: 'thinking' }; },
+  ]) {
+    const changed = structuredClone(original); damage(changed);
+    await f.store.change(s => { Object.assign(s, changed); });
+    const r = (await f.steward.view()).requests.find(r => r.id === reviewId);
+    assert.equal(r.recovery.action, 'none');
+    await assert.rejects(f.steward.acknowledgeRejectedReview({ requestId: reviewId, acknowledgeHash: 'a'.repeat(64) }), /RECOVERY_NOT_SUPPORTED|RECOVERY_REVIEW_STALE/);
+    assert.deepEqual(await f.store.read(), changed);
+  }
+  await f.store.change(s => { Object.assign(s, original); });
+  f.advance(Date.parse('2030-01-02T12:00:00.000Z') - Date.parse(f.now())); await f.steward.pause();
+  const r = (await f.steward.view()).requests.find(r => r.id === reviewId);
+  assert.equal(r.recovery.case, 'expired_authority'); assert.equal(r.recovery.action, 'acknowledge');
+  await f.steward.acknowledgeRejectedReview({ requestId: reviewId, acknowledgeHash: r.recovery.acknowledgeHash });
+  assert.equal((await f.store.read()).paused, true);
+  await assert.rejects(f.steward.propose(ask('after-refusal-paused')), /ADMISSION_PAUSED/);
+  await f.steward.resume();
+  await assert.rejects(f.steward.propose(ask('after-refusal-expired')), /CONTEXT_EXPIRED/);
+});
+
+
+test('a real refused retry chain cannot be acknowledged or retried again', async t => {
+  const pool = new TestPool(); t.after(() => pool.end()); await pool.query(stateSchema);
+  const now = () => '2026-09-24T12:00:00.000Z';
+  const store = new HostedStore(pool, { ownerId: ownerEmail, projectId: project.id });
+  await store.initialize(initialState(project, { model: HOSTED_MODEL, budgetMicros: 1_000_000 }));
+  let sends = 0;
+  const steward = new HostedSteward(store, async input => hostedTransport({ store,
+    requestId: input.hostedRequestId, inputDigest: digest(input), sessionId: `synthetic-chain-${input.hostedRequestId}`, now,
+    send: async () => {
+      sends++;
+      return new Response(JSON.stringify({ error: { type: sends === 1 ? 'rate_limit_exceeded' : 'authentication_error' } }),
+        { status: sends === 1 ? 429 : 401 });
+    } })('https://ai-gateway.vercel.sh/v4/ai/language-model', { method: 'POST',
+      headers: { 'ai-language-model-id': HOSTED_MODEL }, body: JSON.stringify({ maxOutputTokens: 2048,
+        prompt: [{ role: 'user', content: 'Synthetic' }], tools: [{ type: 'function', name: 'final_output', inputSchema: { type: 'object' } }] }) }), { now });
+  await steward.propose(ask('chain-original'));
+  const original = (await steward.view()).requests.find(r => r.id === 'chain-original');
+  assert.equal(original.recovery.canRetry, true);
+  const retry = { ...ask('chain-child'), expectedContextRevision: original.contextRevision,
+    retryOf: original.id, rejectionHash: original.retryReviewHash };
+  assert.equal((await steward.propose(retry)).status, 'held');
+  assert.equal(sends, 2);
+  const before = await store.read();
+  const records = (await steward.view()).requests;
+  for (const id of ['chain-original', 'chain-child']) {
+    const record = records.find(r => r.id === id);
+    assert.equal(record.recovery.action, 'none'); assert.equal(record.recovery.canRetry, false);
+    await assert.rejects(steward.acknowledgeRejectedReview({ requestId: id, acknowledgeHash: 'a'.repeat(64) }), /RECOVERY_NOT_SUPPORTED/);
+  }
+  assert.equal(before.requests['chain-original'].retryRequestId, 'chain-child');
+  assert.equal(before.requests['chain-child'].retryOf, 'chain-original');
+  await assert.rejects(steward.propose({ ...retry, requestId: 'chain-second-retry' }), /UNRESOLVED_MODEL_ATTEMPT|RETRY_REVIEW_MISMATCH/);
+  assert.deepEqual(await store.read(), before); assert.equal(sends, 2);
 });
