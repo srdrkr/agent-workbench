@@ -77,3 +77,9 @@ status read reconciles an existing record. If it finds no record, the owner can 
 saved submission with the same ID and text, preserving server idempotency. Nothing is
 resent automatically. Signing out clears the local receipt. Held records continue to
 refresh so provider wait periods and stopped-task recovery controls become current.
+
+## Legacy schema-refusal recovery
+
+A stopped, released automatic review may have a recorded Gateway generation and HTTP 400 but no parsed error category. An operator can inspect that exact generation in the existing Gateway UI. If it explicitly reports an unsupported tool schema, the authenticated `POST /api/steward/recovery/observe-schema-rejection` route accepts the current record's `rejectionObservationHash`, request ID, matching `generationId`, observation time, `providerStatus: 400`, `reason: "unsupported_tool_schema"` and `source: "owner_provider_ui"`. A status code, zero cost, a PR or a worker report alone is insufficient. This is an owner observation, not an automatic provider read.
+
+The observation stays separate from the original transport receipt and enables the existing failed-review acknowledgement. It does not acknowledge by itself, replay the review, resume the old grant, release a coding job, change the brief or refund its reserved allowance. Unknown deliveries and unverified successful responses remain held. Exact duplicate observations are idempotent; changed evidence needs a fresh review.

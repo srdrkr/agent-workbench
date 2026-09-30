@@ -5,7 +5,7 @@ import { attemptLimit, continuationPacket, reviewContinuation, approveContinuati
 import { previewContext, applyContext } from './context.js';
 import { validateProject, validateProposal } from '../../../src/steward-policy.js';
 import { validateAssignmentDraft } from './assignment-draft.js';
-import { heldRecovery, acknowledgeRejectedReview, rejectionReviewHash } from './recovery.js';
+import { heldRecovery, acknowledgeRejectedReview, rejectionReviewHash, rejectionObservationHash, observeSchemaRejection } from './recovery.js';
 export { rejectionReviewHash } from './recovery.js';
 
 export const digest = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
@@ -36,6 +36,7 @@ export class HostedSteward {
   reviewContinuation() { return reviewContinuation(this.store, this.now()); }
   approveContinuation(input) { return approveContinuation(this.store, input, this.now()); }
   acknowledgeRejectedReview(input) { return acknowledgeRejectedReview(this.store, input, this.now()); }
+  observeSchemaRejection(input) { return observeSchemaRejection(this.store, input, this.now()); }
   previewContext(project) { return previewContext(this.store, project, this.now()); }
   applyContext(input) { return applyContext(this.store, input, this.now()); }
   async view() {
@@ -45,7 +46,7 @@ export class HostedSteward {
     let continuationProblem = null;
     try { judgmentProject(state, this.now()); } catch (error) { continuationProblem = error.message; }
     return { observedAt: now, followThrough: followThroughView(state), pilot: state.pilot ?? null, progress: progressView(state), monitor: state.monitor ? { lastCheckedAt: state.monitor.lastCheckedAt, lastError: state.monitor.lastError, notificationStatus: state.monitor.notificationStatus } : null, repeatableCoding: Boolean(this.coding?.config?.repeatable), continuationAvailable, continuationProblem, project: state.project, contextFresh: fresh(state.project, this.now()), judge: state.model,
-      requests: Object.values(state.requests).sort((a, b) => (b.createdAt ?? '').localeCompare(a.createdAt ?? '') || (b.id ?? '').localeCompare(a.id ?? '')).slice(0, 50).map(r => ({ ...r, retryReviewHash: rejectionReviewHash(r), recovery: heldRecovery(state, r, now) })), commitments: Object.values(state.commitments).filter(c => c.contextRevision === state.project.revision),
+      requests: Object.values(state.requests).sort((a, b) => (b.createdAt ?? '').localeCompare(a.createdAt ?? '') || (b.id ?? '').localeCompare(a.id ?? '')).slice(0, 50).map(r => ({ ...r, retryReviewHash: rejectionReviewHash(r), recovery: heldRecovery(state, r, now), rejectionObservationHash: rejectionObservationHash(state, r) })), commitments: Object.values(state.commitments).filter(c => c.contextRevision === state.project.revision),
       historicalCommitments: Object.values(state.commitments).filter(c => c.contextRevision !== state.project.revision),
       providerAttempts: Object.values(state.requests).filter(r => r.provider).length, maxProviderAttempts: attemptLimit(state),
       budgetMicros: state.budgetMicros, reservedMicros: state.reservedMicros, paused: state.paused,
