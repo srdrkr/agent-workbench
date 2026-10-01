@@ -120,7 +120,9 @@ test('actual Eve runtime returns a structured mock judgment with no external too
     const hosted = await createEveJudge({ enabled: true, hosted: true, host, authToken });
     assert.equal((await hosted({ ...input, hostedRequestId: 'hosted-request' })).kind, 'clarify');
     const reviewer = await createEveJudge({ enabled: true, hosted: true, review: true, host, authToken });
-    assert.deepEqual(await reviewer({ ...input, hostedRequestId: 'review-runtime' }), { verdict: 'ready', summary: 'Synthetic patch reviewed.', findings: [] });
+    assert.deepEqual(await reviewer({ ...input, hostedRequestId: 'review-runtime', mode: 'coding_review' }), { verdict: 'ready', summary: 'Synthetic patch reviewed.', findings: [] });
+    await assert.rejects(reviewer({ ...input, hostedRequestId: 'wrong-review-mode', mode: 'assignment_draft' }), /JUDGE_INPUT_INVALID/);
+    await assert.rejects(hosted({ ...input, hostedRequestId: 'unapproved-review', mode: 'coding_review' }), /JUDGE_INPUT_INVALID/);
     const withCandidate = { ...input, project: { ...input.project,
       codingCandidates: [{ id: 'normalize', title: 'Normalize whitespace', sourceIds: ['brief'] }] } };
     assert.equal((await judge(withCandidate)).kind, 'coding');

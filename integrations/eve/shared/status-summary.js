@@ -1,4 +1,4 @@
-import { followThroughNotice } from './follow-through-notice.js';
+import { followThroughNotice, REVIEW_SIZE_STOP_REASON } from './follow-through-notice.js';
 /**
  * One short project-status summary shared by Telegram and the web view.
  *
@@ -32,7 +32,7 @@ const list = value => (Array.isArray(value) ? value.filter(v => v && typeof v ==
 const usd = micros => `$${(micros / 1e6).toFixed(2)}`;
 
 const GITHUB = {
-  merged_pr: 'PR merged; deployment not verified',
+  merged_pr: 'PR merged; deployment is separate',
   tested_draft_pr: 'draft PR passed required checks',
   needs_review: 'PR open; checks or review pending',
   branch_without_pr: 'branch pushed; no PR yet',
@@ -83,6 +83,14 @@ function facts(view, options = {}) {
   const jobs = scoped(v.progress?.jobs, v.codingJobs);
   const commitments = scoped(v.progress?.commitments, v.commitments);
   const job = latest(jobs, 'dispatchStartedAt');
+  const follow = v.followThrough;
+  const chain = follow?.taskId ? jobs.filter(j => j.id === follow.taskId || j.rootTaskId === follow.taskId) : [];
+  const last = latest(chain, 'dispatchStartedAt');
+  // Only the known capacity stop becomes historical after a merge and exit.
+  // Scope changes, review findings and uncertain corrections still need attention.
+  const settledFollow = (follow?.status === 'finished' || (follow?.status === 'blocked' && follow.reason === REVIEW_SIZE_STOP_REASON))
+    && last?.result?.result === 'merged_pr'
+    && chain.every(j => j.releasedAt && ['exited', 'stopped'].includes(j.execution));
   // dispatch: routine receipt ('unknown' until observed; 'accepted', 'rejected', 'usage_limited').
   // execution: owner-observed session state ('unobserved', 'running', 'exited', 'stopped').
   const dispatch = job?.dispatch; const execution = job?.execution;
@@ -95,11 +103,14 @@ function facts(view, options = {}) {
   const stalled = pending && requestStalled(pending, Number.isFinite(nowMs) ? new Date(nowMs).toISOString() : undefined) ? pending : null;
   const thinking = stalled ? null : pending;
   const newest = latest(current, 'createdAt');
+  const settledSizeRefusal = settledFollow && newest?.status === 'not_sent' && newest.purpose === 'coding_review'
+    && newest.taskId === follow.taskId && newest.admissionFailure?.code === 'REVIEW_CONTEXT_TOO_LARGE';
   const jobOpen = Boolean(job && !job.releasedAt && !failedStart);
   return {
     v, job, held, thinking, stalled, unknownSubmission, jobOpen, failedStart,
+    settledFollow, followThrough: settledFollow ? null : follow,
     needsContext: newest?.status === 'needs_context' ? newest : null,
-    notSent: newest?.status === 'not_sent' ? newest : null,
+    notSent: newest?.status === 'not_sent' && !settledSizeRefusal ? newest : null,
     acknowledged: ['rejection_acknowledged', 'failure_acknowledged'].includes(newest?.status) ? newest : null,
     startUnconfirmed: jobOpen && dispatch !== 'accepted' && !['running', 'exited', 'stopped'].includes(execution),
     running: jobOpen && execution === 'running',
@@ -152,6 +163,7 @@ function blocker({ v, held, thinking, stalled, unknownSubmission, job, jobOpen, 
   if (v.monitor?.lastError) return ['GitHub check unavailable; older result shown', ''];
   if (thinking) return [thinking.purpose === 'coding_review' ? 'none; Eve is reviewing the pull request' : 'none; Eve is working on your request', ''];
   if (job?.result?.result === 'conflicting_prs') return ['several PRs match one task', ''];
+  if (notSent?.purpose === 'coding_review' && notSent.admissionFailure?.code === 'REVIEW_CONTEXT_TOO_LARGE') return ['review envelope exceeds the size limit', ''];
   if (notSent) return ['the last request was not sent', ''];
   return ['none recorded', ''];
 }
@@ -176,11 +188,11 @@ function next(f) {
   if (v.contextFresh === false) return ['update the project brief', '', 'blocked'];
   // An acknowledged failed review of the stopped task: the PR is still unreviewed; nothing is retried.
   if (f.acknowledged && !dollarsExhausted && !attemptsExhausted
-    && v.followThrough?.status === 'blocked' && f.acknowledged.taskId === v.followThrough.taskId) {
+    && f.followThrough?.status === 'blocked' && f.acknowledged.taskId === f.followThrough.taskId) {
     return ['review the PR yourself or start a fresh request; the failed review stays in history', '', 'awaiting_decision'];
   }
-  const follow = v.followThrough && followThroughNotice(v.followThrough);
-  if (follow) return ['', follow, ['blocked', 'waiting_for_connection'].includes(v.followThrough.status) ? 'blocked' : 'awaiting_decision'];
+  const follow = f.followThrough && followThroughNotice(f.followThrough);
+  if (follow) return ['', follow, ['blocked', 'waiting_for_connection'].includes(f.followThrough.status) ? 'blocked' : 'awaiting_decision'];
   if (jobOpen) {
     if (startUnconfirmed) return ['check Claude, then confirm or close the run', '', 'blocked'];
     if (ended) return [result === 'tested_draft_pr' ? 'close the coding run, then review the draft PR' : 'check GitHub, then close the coding run', '', 'awaiting_decision'];
@@ -199,8 +211,10 @@ function next(f) {
   if (awaiting?.draftFeedback?.gap) return ['prepare the assignment manually in the web app: ', awaiting.draftFeedback.gap, 'awaiting_decision'];
   if (awaiting) return [awaiting.assignmentDraft ? 'review the draft assignment: ' : awaiting.proposal.kind === 'coding' ? 'review the coding assignment: ' : 'decide on the proposal: ', awaiting.proposal.title, 'awaiting_decision'];
   if (needsContext) return ['answer Eve\'s question in a new request: ', needsContext.proposal?.question ?? needsContext.proposal?.title ?? '', 'awaiting_decision'];
+  if (notSent?.purpose === 'coding_review' && notSent.admissionFailure?.code === 'REVIEW_CONTEXT_TOO_LARGE') return ['split the coding task or review this PR manually', '', 'blocked'];
   if (notSent) return ['check the allowance and brief size, then ask again', '', 'blocked'];
-  if (f.acknowledged) return [`start a fresh request; the failed ${f.acknowledged.purpose === 'coding_review' ? 'review' : 'request'} stays in history`, '', 'ready'];
+  if (f.acknowledged) return [`start a fresh request; the failed ${f.acknowledged.purpose === 'coding_review' ? 'review' : 'request'} stays in history`, '',
+    f.settledFollow && f.acknowledged.taskId === v.followThrough.taskId ? 'completed' : 'ready'];
   if (v.continuationAvailable) return ['review the next Eve request', '', 'awaiting_decision'];
   if (open) return ['work on: ', open.title, 'decision_recorded'];
   const finished = done || (job && job.releasedAt && result === 'merged_pr') ? 'completed' : 'ready';

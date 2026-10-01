@@ -146,3 +146,71 @@ export async function scenarioTerminalFailure({ fixture, page, kit, login, scree
   kit.pass('terminal-failure-observed-rechecked-and-retained', { reads, historyRetained: true, noModelCall: true });
   return kit.assertions;
 }
+
+
+export async function scenarioCompletedReviewHistory({ fixture, page, kit, login, screenshot }) {
+  const { reviewId } = await fixture.prepareHeldReview('rate_limited');
+  const record = (await fixture.steward.view()).requests.find(r => r.id === reviewId);
+  await fixture.steward.acknowledgeRejectedReview({ requestId: reviewId, acknowledgeHash: record.recovery.acknowledgeHash });
+  await fixture.store.change(s => {
+    // Keep the acknowledged record on the current brief. Model a later capacity stop.
+    const task = s.coding.jobs['synthetic-task'];
+    task.result.result = 'merged_pr';
+    task.followThrough.reason = 'Patch exceeds the review limit. Split the task or review this PR manually.';
+  });
+  const before = await fixture.store.read(); const calls = JSON.stringify(fixture.modelCalls());
+  await login(page, fixture);
+  const summary = () => page.locator('p.summary').innerText();
+  if (!/^State: Completed\./.test(await summary()) || !/Progress: PR merged; deployment is separate\./.test(await summary())
+    || /Eve stopped|deployment not verified|deployed/i.test(await summary())) kit.fail('completed-review-summary', await summary());
+  if (await page.locator('section.ask textarea').isDisabled()) kit.fail('completed-review-input-disabled', 'input disabled');
+  kit.pass('merged-closed-task-no-longer-blocked', { state: 'completed', requestInputAvailable: true });
+  await screenshot(page);
+
+  await fixture.store.change(s => { delete s.coding.jobs['synthetic-task'].releasedAt; });
+  await page.getByRole('button', { name: 'Refresh status', exact: true }).click();
+  await page.waitForFunction(() => document.querySelector('p.summary')?.textContent?.includes('run not closed'));
+  if (/^State: Completed\./.test(await summary())) kit.fail('unreleased-writer-marked-completed', await summary());
+  kit.pass('unreleased-writer-keeps-close-run-guidance', true);
+
+  await fixture.store.change(s => {
+    s.coding.jobs['synthetic-task'].releasedAt = before.coding.jobs['synthetic-task'].releasedAt;
+    s.requests[reviewId].status = 'held';
+  });
+  await page.getByRole('button', { name: 'Refresh status', exact: true }).click();
+  await page.waitForFunction(() => document.querySelector('p.summary')?.textContent?.includes('Blocker: provider refused'));
+  if (!/^State: Blocked\./.test(await summary())) kit.fail('held-review-hidden-by-merge', await summary());
+  kit.pass('held-prior-brief-review-remains-blocked', true);
+
+  await fixture.store.change(s => { s.requests[reviewId].status = 'rejection_acknowledged'; });
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await page.waitForFunction(() => document.querySelector('p.summary')?.textContent?.startsWith('State: Completed.'));
+  await fixture.store.change(s => {
+    s.requests['review-envelope-size'] = { id: 'review-envelope-size', purpose: 'coding_review', taskId: 'synthetic-task',
+      contextRevision: s.project.revision, status: 'not_sent', createdAt: new Date().toISOString(),
+      message: 'Synthetic automatic review refused before provider I/O',
+      admissionFailure: { code: 'REVIEW_CONTEXT_TOO_LARGE', requestBytes: 48_001, at: new Date().toISOString() } };
+  });
+  await page.getByRole('button', { name: 'Refresh status', exact: true }).click();
+  await page.waitForFunction(() => document.querySelector('p.summary')?.textContent?.startsWith('State: Completed.'));
+  await page.getByText('Review not sent · size limit', { exact: true }).waitFor({ timeout: 20000 });
+  await page.getByText('The review exceeded its request-size limit before any provider call. No model allowance was reserved for this review.', { exact: true }).waitFor({ timeout: 20000 });
+  if (!/^State: Completed\./.test(await summary()) || /review envelope exceeds|split the coding task/.test(await summary())
+    || await page.locator('section.ask textarea').isDisabled()) kit.fail('settled-refusal-still-blocks', await summary());
+  kit.pass('settled-size-refusal-stays-in-history-without-blocking', true);
+  await fixture.store.change(s => {
+    s.requests['ordinary-not-sent'] = { id: 'ordinary-not-sent', contextRevision: s.project.revision, status: 'not_sent',
+      createdAt: new Date().toISOString(), message: 'Synthetic ordinary request not admitted' };
+  });
+  await page.getByRole('button', { name: 'Refresh status', exact: true }).click();
+  await page.getByText('Not sent · check allowance or brief size', { exact: true }).waitFor({ timeout: 20000 });
+  if (!/^State: Blocked\./.test(await summary()) || !/the last request was not sent/.test(await summary())) kit.fail('ordinary-refusal-hidden', await summary());
+  await page.getByText('The model was not contacted and no allowance was reserved. Check your remaining allowance and brief size, then submit a new request.', { exact: true }).waitFor({ timeout: 20000 });
+  kit.pass('ordinary-not-sent-history-keeps-generic-wording', true);
+  const after = await fixture.store.read();
+  if (JSON.stringify(fixture.modelCalls()) !== calls || before.reservedMicros !== after.reservedMicros
+    || JSON.stringify(before.coding.jobs['synthetic-task'].followThrough) !== JSON.stringify(after.coding.jobs['synthetic-task'].followThrough)
+    || JSON.stringify(before.requests[reviewId].provider) !== JSON.stringify(after.requests[reviewId].provider)) kit.fail('completed-history-mutated', 'model call or changed evidence/accounting');
+  kit.pass('completion-survives-refresh-with-history-and-accounting', { noModelCalls: true, stoppedHistoryRetained: true });
+  return kit.assertions;
+}
