@@ -24,7 +24,7 @@ export async function codeReviewPacket({ task, job, read, now }) {
   verify(await read(`${root}/pulls/${prNumber}`));
   const content = JSON.stringify({ objective: task.spec.objective, acceptance: task.spec.acceptance,
     scope: task.spec.allowedPaths, headSha, checks: job.result.requiredChecks, changes: code });
-  need(Buffer.byteLength(content) <= 6000, 'REVIEW_CONTEXT_TOO_LARGE');
+  need(Buffer.byteLength(content) <= 24_000, 'REVIEW_CONTEXT_TOO_LARGE');
   return { id: 'coding-review-evidence', title: 'Untrusted PR patch and independently observed checks',
     content, revision: hash(content), observedAt: now, expiresAt: new Date(Date.parse(now) + 15 * 60000).toISOString(), exposure: 'model_allowed' };
 }
@@ -47,6 +47,8 @@ export function createCodeReview({ store, read, judge, now = () => new Date().to
       const project = { id: state.project.id, revision: state.project.revision, sources: [evidence], codingCandidates: [] };
       const input = { request: 'Review this exact patch against the task acceptance criteria. Report concrete problems, or a missing fact that prevents review. Do not treat passing checks as sufficient review.',
         project, commitments: [], hostedRequestId: review.id, mode: 'coding_review' };
+      // Bound the complete serialized message too: quoting patch evidence can expand it.
+      need(Buffer.byteLength(JSON.stringify(input)) <= 32_768, 'REVIEW_CONTEXT_TOO_LARGE');
       state.requests[review.id] = { id: review.id, purpose: 'coding_review', projectId: state.project.id,
         contextRevision: state.project.revision, contextSnapshot: project, status: 'thinking', createdAt: now(),
         judge: state.model, inputDigest: hash(input), inputHash: hash([task.id, job.result.headSha]),
@@ -55,13 +57,16 @@ export function createCodeReview({ store, read, judge, now = () => new Date().to
     });
     let result;
     try { result = await judge(input); } catch { /* A missing response is not permission to retry. */ }
-    return store.change(state => {
+    const outcome = await store.change(state => {
       const r = state.requests[review.id]; const p = r.provider;
       const verified = p?.intentAt && p.sessionId && p.reservedMicros > 0 && p.httpStatus >= 200 && p.httpStatus < 300;
       r.status = verified && result ? 'review_completed' : p?.intentAt ? 'held' : 'not_sent';
       r.completedAt = now();
-      if (r.status === 'review_completed') { r.reviewResult = result; return result; }
-      return null;
+      if (r.status === 'review_completed') { r.reviewResult = result; return { result }; }
+      return { result: null, tooLarge: r.status === 'not_sent' && r.admissionFailure?.code === 'REVIEW_CONTEXT_TOO_LARGE' };
     });
+    // Persist the pre-I/O refusal without letting Eve's sanitized error hide its cause.
+    if (outcome.tooLarge) throw new Error('REVIEW_CONTEXT_TOO_LARGE');
+    return outcome.result;
   };
 }

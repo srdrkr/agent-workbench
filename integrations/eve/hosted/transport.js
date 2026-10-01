@@ -21,8 +21,10 @@ export function hostedTransport({ store, requestId, inputDigest, sessionId, send
     const bytes = Buffer.byteLength(serialized);
     // Conservative reservation, never refunded automatically after uncertain I/O.
     const reserve = (bytes + 2048) * 10 + 2048 * 25;
-    await store.change(state => {
+    const admitted = await store.change(state => {
       const record = Object.hasOwn(state.requests, requestId) && state.requests[requestId];
+      // Only an authoritative coding-review record gets room for patches and schema.
+      const maxBytes = record?.purpose === 'coding_review' ? 48_000 : 12_000;
       if (!state.project.sources.every(s => Date.parse(s.observedAt) <= Date.parse(now()) && Date.parse(s.expiresAt) > Date.parse(now()))
         || Object.values(state.requests).filter(r => r.provider).length >= attemptLimit(state)
         || state.paused || state.model !== HOSTED_MODEL || !record || record.status !== 'thinking'
@@ -30,8 +32,7 @@ export function hostedTransport({ store, requestId, inputDigest, sessionId, send
         || !record.contextSnapshot?.sources?.every(s => s.exposure === 'model_allowed' && Date.parse(s.observedAt) <= Date.parse(now()) && Date.parse(s.expiresAt) > Date.parse(now()))
         || (state.continuation && !state.pilot && (state.continuation.contextRevision !== record.contextRevision || state.continuation.model !== state.model
           || !record.contextSnapshot.sources.some(s => s.id === state.continuation.source.id && s.revision === state.continuation.source.revision)))
-        || record.inputDigest !== inputDigest || record.provider || !sessionId || bytes > 12000
-        || state.reservedMicros + reserve > state.budgetMicros) throw new Error('HOSTED_PROVIDER_ADMISSION_DENIED');
+        || record.inputDigest !== inputDigest || record.provider || !sessionId) throw new Error('HOSTED_PROVIDER_ADMISSION_DENIED');
       if (record.purpose === 'coding_review') {
         const root = state.coding?.jobs[record.taskId]; const f = root?.followThrough;
         if (!f || f.status !== 'reviewing' || state.coding.paused
@@ -40,9 +41,16 @@ export function hostedTransport({ store, requestId, inputDigest, sessionId, send
           || state.coding.jobs[f.activeJobId]?.result?.headSha !== record.headSha
           || !f.reviews.some(r => r.id === record.id && r.status === 'intent' && r.headSha === record.headSha)) throw new Error('HOSTED_PROVIDER_ADMISSION_DENIED');
       }
+      if (bytes > maxBytes) {
+        if (record.purpose === 'coding_review') record.admissionFailure = { code: 'REVIEW_CONTEXT_TOO_LARGE', requestBytes: bytes, at: now() };
+        return false;
+      }
+      if (state.reservedMicros + reserve > state.budgetMicros) throw new Error('HOSTED_PROVIDER_ADMISSION_DENIED');
       state.reservedMicros += reserve;
       record.provider = { sessionId, reservedMicros: reserve, requestBytes: bytes, requestHash: hash(serialized), intentAt: now() };
+      return true;
     });
+    if (!admitted) throw new Error('HOSTED_PROVIDER_ADMISSION_DENIED');
     try {
       const response = await send(endpoint, { ...init, body: serialized, redirect: 'error' });
       const rejection = response.ok ? undefined : await rejectionDiagnostics(response);

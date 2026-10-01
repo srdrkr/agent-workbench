@@ -1,3 +1,5 @@
+export const REVIEW_SIZE_STOP_REASON = 'Patch exceeds the review limit. Split the task or review this PR manually.';
+
 export function followThroughNotice(f) {
   const labels = {
     ready_for_owner: 'Eve reviewed the PR. Review its findings and checks before merging.',

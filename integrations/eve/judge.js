@@ -32,7 +32,8 @@ export async function createEveJudge(config = {}) {
     }
     let message;
     try {
-      if ((config.hosted && !/^[a-z0-9][a-z0-9-]{0,63}$/.test(hostedRequestId ?? '')) || ![undefined, 'assignment_draft'].includes(mode)) throw new Error();
+      const allowedModes = config.review === true ? [undefined, 'coding_review'] : [undefined, 'assignment_draft'];
+      if ((config.hosted && !/^[a-z0-9][a-z0-9-]{0,63}$/.test(hostedRequestId ?? '')) || !allowedModes.includes(mode)) throw new Error();
       message = JSON.stringify({ request, project, commitments, ...(config.hosted ? { hostedRequestId } : {}), ...(config.review === true ? { mode: 'coding_review' } : drafting ? { mode } : {}) });
       if (typeof request !== 'string' || !request.trim() || !project || !Array.isArray(commitments)
           || Buffer.byteLength(message) > 32_768) throw new Error();

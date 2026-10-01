@@ -1,4 +1,4 @@
-import { followThroughNotice } from '../shared/follow-through-notice.js';
+import { followThroughNotice, REVIEW_SIZE_STOP_REASON } from '../shared/follow-through-notice.js';
 import { createHash } from 'node:crypto';
 
 export const FOLLOW_THROUGH_LIMITS = Object.freeze({ corrections: 2, reviews: 3, lifetimeMs: 86400000, checkMs: 15 * 60000 });
@@ -96,7 +96,7 @@ export class FollowThrough {
     let result; let failureReason = 'Review failed or was invalid; automatic replay stopped.';
     try { result = await this.review(admission); } catch (error) {
       const reasons = {
-        REVIEW_CONTEXT_TOO_LARGE: 'Patch exceeds the review limit. Split the task or review this PR manually.',
+        REVIEW_CONTEXT_TOO_LARGE: REVIEW_SIZE_STOP_REASON,
         REVIEW_DISCLOSURE_NOT_CONFIGURED: 'Private code review needs an approved disclosure configuration.',
         REVIEW_SCOPE_OR_PATCH_UNAVAILABLE: 'Complete in-scope patch evidence is missing. Review the PR manually.',
         REVIEW_HEAD_CHANGED: 'The PR changed during evidence collection. Review the new head before continuing.',

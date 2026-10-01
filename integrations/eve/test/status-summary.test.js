@@ -161,7 +161,7 @@ test('an unmerged PR stays awaiting review after its coding run closes', async (
   }
   w.state.coding = undefined; codingJob(w.state, { dispatch: 'accepted', execution: 'exited', result: 'merged_pr', released: true });
   const p = parts(await w.summary());
-  assert.equal(p.Progress, 'PR merged; deployment not verified');
+  assert.equal(p.Progress, 'PR merged; deployment is separate');
   assert.equal(p.Next, 'decide on the proposal: Review the blocker');
 });
 
@@ -371,4 +371,110 @@ test('automatic reviews and unresolved prior-brief records retain truthful statu
   view.requests = [{ ...record, local: true, status: 'submission_unknown' }];
   assert.equal(ownerState(view).key, 'blocked'); assert.match(statusSummary(view), /submission outcome unknown/);
   assert.match(statusSummary(view), /do not create a new request/);
+});
+
+
+function stoppedReview(task) {
+  task.followThrough = { status: 'blocked', reason: 'Patch exceeds the review limit. Split the task or review this PR manually.',
+    grant: { maxCorrections: 2 }, reviews: [{ id: 'review-stopped', status: 'unknown' }], attempts: [], nextCheckAt: null };
+}
+test('a merged and closed task does not let its stopped automatic review block the project', async () => {
+  const w = workspace(); const task = codingJob(w.state, { dispatch: 'unknown', execution: 'exited', result: 'merged_pr', released: true });
+  stoppedReview(task); const before = JSON.stringify(w.state);
+  const view = await w.steward.view(); const r = both(view);
+  assert.equal(r.key, 'completed'); assert.equal(r.p.Progress, 'PR merged; deployment is separate'); assert.equal(r.p.Blocker, 'none recorded');
+  assert.equal(r.p.Next, 'ask Eve for the next useful step');
+  assert.doesNotMatch(r.text, /Eve stopped|deployment not verified|deployed/i);
+  assert.match(r.text, /deployment is separate/);
+  assert.equal(view.followThrough.status, 'blocked'); assert.equal(view.followThrough.lastReview.status, 'unknown');
+  assert.equal(JSON.stringify(w.state), before); assert.equal(statusSummary(view, { link: LINK }), `${statusSummary(view)}\n${LINK}`);
+});
+
+test('an unmerged task, unreleased writer or nonterminal action keeps its review notice', async () => {
+  for (const options of [{ execution: 'exited', result: 'tested_draft_pr', released: true },
+    { execution: 'exited', result: 'merged_pr', released: false },
+    { execution: 'running', result: 'merged_pr', released: true },
+    { execution: 'unobserved', result: 'merged_pr', released: true }]) {
+    const w = workspace(); stoppedReview(codingJob(w.state, { dispatch: 'accepted', ...options }));
+    const r = both(await w.steward.view()); assert.equal(r.key, 'blocked'); assert.match(r.p.Next, /Eve stopped/);
+  }
+  const w = workspace(); const task = codingJob(w.state, { dispatch: 'accepted', execution: 'exited', result: 'merged_pr', released: true });
+  stoppedReview(task); task.followThrough.status = 'waiting_for_connection';
+  assert.equal(both(await w.steward.view()).key, 'blocked');
+});
+
+test('completed correction chains settle only after every writer is ended and released', async () => {
+  const w = workspace(); const root = codingJob(w.state, { id: 'root', dispatch: 'accepted', execution: 'exited', result: 'tested_draft_pr', released: true });
+  stoppedReview(root);
+  const correction = codingJob(w.state, { id: 'fix', dispatch: 'accepted', execution: 'exited', result: 'merged_pr', released: true });
+  correction.rootTaskId = root.id;
+  assert.equal(both(await w.steward.view()).key, 'completed');
+  delete root.releasedAt; assert.equal(both(await w.steward.view()).key, 'blocked');
+  root.releasedAt = now(); correction.result.result = 'needs_review'; assert.equal(both(await w.steward.view()).key, 'blocked');
+});
+
+test('a settled historical review cannot hide a new request or writer', async () => {
+  const w = workspace(); const old = codingJob(w.state, { id: 'old', dispatch: 'accepted', execution: 'exited', result: 'merged_pr', released: true });
+  stoppedReview(old);
+  const view = await w.steward.view();
+  for (const [overrides, key] of [[{ paused: true }, 'blocked'], [{ contextFresh: false }, 'blocked'],
+    [{ reservedMicros: view.budgetMicros }, 'blocked'], [{ requests: [{ status: 'held' }] }, 'blocked'],
+    [{ requests: [{ status: 'thinking', createdAt: view.observedAt }] }, 'working']]) {
+    assert.equal(both({ ...view, ...overrides }).key, key);
+  }
+  codingJob(w.state, { id: 'new', dispatch: 'accepted', execution: 'running' });
+  const r = both(await w.steward.view()); assert.equal(r.key, 'working'); assert.match(r.p.Next, /wait for Claude/);
+});
+
+test('merges never conceal unresolved safety stops or unknown stop reasons', async () => {
+  for (const reason of ['PR scope or approved base changed.', 'Review needs an owner decision: missing acceptance evidence',
+    'A finding repeated after correction; owner decision required.', 'Correction delivery uncertain or rejected; not retried.',
+    'Previous action outcome is uncertain; automatic replay stopped.', 'A future unrecognized stop reason']) {
+    const w = workspace(); const task = codingJob(w.state, { dispatch: 'accepted', execution: 'exited', result: 'merged_pr', released: true });
+    stoppedReview(task); task.followThrough.reason = reason;
+    const r = both(await w.steward.view());
+    assert.equal(r.key, 'blocked'); assert.match(r.p.Next, /Eve stopped/);
+    assert.equal(task.followThrough.reason, reason);
+  }
+});
+
+test('an acknowledged review on the current brief reports completed after a settled merge', async () => {
+  const w = workspace(); const task = codingJob(w.state, { dispatch: 'accepted', execution: 'exited', result: 'merged_pr', released: true });
+  stoppedReview(task);
+  w.state.requests['review-stopped'] = { id: 'review-stopped', purpose: 'coding_review', taskId: task.id,
+    contextRevision: w.state.project.revision, status: 'rejection_acknowledged', createdAt: now() };
+  const r = both(await w.steward.view()); assert.equal(r.key, 'completed');
+  assert.match(r.p.Next, /start a fresh request; the failed review stays in history/);
+  task.followThrough.reason = 'Review needs an owner decision: unresolved defect';
+  assert.notEqual(both(await w.steward.view()).key, 'completed');
+});
+
+test('a recorded pre-I/O size refusal becomes historical only for its settled task', async () => {
+  const w = workspace(); const task = codingJob(w.state, { dispatch: 'accepted', execution: 'exited', result: 'merged_pr', released: true });
+  stoppedReview(task);
+  const at=now(); const record = w.state.requests['review-envelope-size'] = { id: 'review-envelope-size', purpose: 'coding_review', taskId: task.id,
+    contextRevision: w.state.project.revision, status: 'not_sent', createdAt: at,
+    admissionFailure: { code: 'REVIEW_CONTEXT_TOO_LARGE', requestBytes: 48_001, at } };
+  let r = both(await w.steward.view()); assert.equal(r.key, 'completed'); assert.equal(r.p.Blocker, 'none recorded');
+  assert.equal(record.status, 'not_sent'); assert.equal(record.provider, undefined); assert.equal(w.state.reservedMicros, 0);
+  task.result.result = 'tested_draft_pr'; r = both(await w.steward.view());
+  assert.equal(r.key, 'blocked'); assert.match(r.p.Next, /review limit/); assert.equal(r.p.Blocker, 'review envelope exceeds the size limit');
+  task.result.result = 'merged_pr'; delete task.releasedAt; assert.equal(both(await w.steward.view()).key, 'blocked');
+  task.releasedAt = now();
+  for (const mutate of [() => { record.taskId = 'another-task'; }, () => { record.purpose = undefined; },
+    () => { record.admissionFailure.code = 'UNRECOGNIZED'; }]) {
+    record.taskId = task.id; record.purpose = 'coding_review'; record.admissionFailure.code = 'REVIEW_CONTEXT_TOO_LARGE';
+    mutate(); assert.equal(both(await w.steward.view()).key, 'blocked');
+  }
+});
+
+test('finished size refusals settle while a newer unrelated not-sent request stays visible', async () => {
+  const w = workspace(); const task = codingJob(w.state, { dispatch: 'accepted', execution: 'exited', result: 'merged_pr', released: true });
+  stoppedReview(task); task.followThrough.status = 'finished';
+  w.state.requests['review-capacity'] = { id: 'review-capacity', purpose: 'coding_review', taskId: task.id,
+    contextRevision: w.state.project.revision, status: 'not_sent', createdAt: now(),
+    admissionFailure: { code: 'REVIEW_CONTEXT_TOO_LARGE', requestBytes: 48_001, at: now() } };
+  assert.equal(both(await w.steward.view()).key, 'completed');
+  w.state.requests['ordinary-newer'] = { id: 'ordinary-newer', contextRevision: w.state.project.revision, status: 'not_sent', createdAt: now() };
+  const r = both(await w.steward.view()); assert.equal(r.key, 'blocked'); assert.equal(r.p.Blocker, 'the last request was not sent');
 });

@@ -125,7 +125,7 @@ test('review evidence rejects a moving head, oversized patch and private disclos
   const packet = await codeReviewPacket({ task: w.task, job: w.task, read: reader(w.task), now: w.now() });
   assert.match(packet.content, /slug.js/);
   await assert.rejects(codeReviewPacket({ task: w.task, job: w.task, read: reader(w.task, { changed: true }), now: w.now() }), /HEAD_CHANGED/);
-  await assert.rejects(codeReviewPacket({ task: w.task, job: w.task, read: reader(w.task, { patch: 'x'.repeat(6001) }), now: w.now() }), /TOO_LARGE/);
+  await assert.rejects(codeReviewPacket({ task: w.task, job: w.task, read: reader(w.task, { patch: 'x'.repeat(24_001) }), now: w.now() }), /TOO_LARGE/);
   w.task.spec.visibility = 'private';
   await assert.rejects(codeReviewPacket({ task: w.task, job: w.task, read: reader(w.task), now: w.now() }), /DISCLOSURE/);
 });
@@ -224,4 +224,108 @@ test('a successful review reserves against the existing cumulative model allowan
   assert.equal(w.state.reservedMicros, 1 + request.provider.reservedMicros);
   assert.equal(w.state.budgetMicros, 10_000_000);
   await assert.rejects(service({ task: w.task, job: w.task, review }), /ADMISSION_DENIED/);
+});
+
+
+test('a small edit with long template context retains the entire exact patch above the old cap', async () => {
+  const w = fixture();
+  const patch = '@@ -1,3 +1,3 @@\n ' + '<p>Unchanged template context.</p>'.repeat(300) + '\n-old\n+new\n end';
+  const packet = await codeReviewPacket({ task: w.task, job: w.task, read: reader(w.task, { patch }), now: w.now() });
+  assert.ok(Buffer.byteLength(packet.content) > 6000);
+  const evidence = JSON.parse(packet.content);
+  assert.equal(evidence.changes[0].patch, patch);
+  assert.equal(evidence.headSha, A); assert.deepEqual(evidence.scope, ['slug.js']);
+  assert.equal(evidence.objective, w.task.spec.objective);
+});
+
+test('review evidence enforces the exact byte boundary, including multibyte text', async () => {
+  const w = fixture(); const patch = '@@ -1 +1 @@\n-a\n+b';
+  const first = await codeReviewPacket({ task: w.task, job: w.task, read: reader(w.task, { patch }), now: w.now() });
+  const exact = patch + 'x'.repeat(24_000 - Buffer.byteLength(first.content));
+  const packet = await codeReviewPacket({ task: w.task, job: w.task, read: reader(w.task, { patch: exact }), now: w.now() });
+  assert.equal(Buffer.byteLength(packet.content), 24_000);
+  for (const suffix of ['x', '€']) {
+    await assert.rejects(codeReviewPacket({ task: w.task, job: w.task, read: reader(w.task, { patch: exact + suffix }), now: w.now() }), /CONTEXT_TOO_LARGE/);
+  }
+});
+
+test('nested quoting cannot exceed the full message limit or create a request intent', async () => {
+  const w = fixture(); const patch = '"'.repeat(9000);
+  const packet = await codeReviewPacket({ task: w.task, job: w.task, read: reader(w.task, { patch }), now: w.now() });
+  assert.ok(Buffer.byteLength(packet.content) < 24_000);
+  const review = { id: 'review-quoted', status: 'intent', headSha: A };
+  w.task.followThrough.status = 'reviewing'; w.task.followThrough.reviews.push(review);
+  let calls = 0;
+  const service = createCodeReview({ store: w.store, read: reader(w.task, { patch }), now: w.now, judge: async () => { calls++; } });
+  await assert.rejects(service({ task: w.task, job: w.task, review }), /CONTEXT_TOO_LARGE/);
+  assert.equal(calls, 0); assert.equal(w.state.requests[review.id], undefined);
+  assert.equal(w.state.reservedMicros, 1);
+});
+
+test('large review envelopes stay metered and bounded without enlarging ordinary request authority', async () => {
+  const { gatewayRequest, endpoint } = await import('../gateway-request.js');
+  for (const options of [{ bytes: 48_000, sends: 1 }, { bytes: 48_001, sends: 0 },
+    { bytes: 48_000, budget: 100_000, sends: 0 }, { bytes: 48_000, ordinary: true, sends: 0 }]) {
+    const w = fixture(); w.state.model = HOSTED_MODEL;
+    if (options.budget) w.state.budgetMicros = options.budget;
+    const review = { id: 'review-large', status: 'intent', headSha: A };
+    w.task.followThrough.status = 'reviewing'; w.task.followThrough.reviews.push(review);
+    let sends = 0;
+    const patch = '@@ -1 +1 @@\n-a\n+b' + ' context'.repeat(1500);
+    const judge = async input => {
+      assert.equal(JSON.parse(input.project.sources[0].content).changes[0].patch, patch);
+      if (options.ordinary) delete w.state.requests[review.id].purpose;
+      const body = { maxOutputTokens: 2048, prompt: [{ role: 'system', content: '' }, { role: 'user', content: JSON.stringify(input) }],
+        tools: [{ type: 'function', name: 'final_output', inputSchema: { type: 'object' } }] };
+      const init = () => ({ method: 'POST', headers: { 'ai-language-model-id': HOSTED_MODEL }, body: JSON.stringify(body) });
+      body.prompt[0].content = 'x'.repeat(options.bytes - Buffer.byteLength(gatewayRequest(endpoint, init(), HOSTED_MODEL).serialized));
+      const transport = hostedTransport({ store: w.store, requestId: review.id, inputDigest: digest(input), sessionId: 'synthetic-large-review', now: w.now,
+        send: async () => { sends++; return new Response('synthetic', { status: 200 }); } });
+      await transport(endpoint, init());
+      return { verdict: 'ready', summary: 'Synthetic large review', findings: [] };
+    };
+    const service = createCodeReview({ store: w.store, read: reader(w.task, { patch }), judge, now: w.now });
+    let result = null;
+    if (options.bytes > 48_000 && !options.ordinary) await assert.rejects(service({ task: w.task, job: w.task, review }), /CONTEXT_TOO_LARGE/);
+    else result = await service({ task: w.task, job: w.task, review });
+    const record = w.state.requests[review.id];
+    assert.equal(sends, options.sends); assert.equal(w.state.budgetMicros, options.budget ?? 10_000_000);
+    if (options.sends) {
+      assert.equal(result.verdict, 'ready'); assert.equal(record.status, 'review_completed');
+      assert.equal(record.provider.requestBytes, 48_000);
+      assert.equal(w.state.reservedMicros, 1 + record.provider.reservedMicros);
+      await assert.rejects(service({ task: w.task, job: w.task, review }), /ADMISSION_DENIED/);
+      assert.equal(sends, 1);
+    } else {
+      assert.equal(result, null); assert.equal(record.status, 'not_sent');
+      assert.equal(record.provider, undefined); assert.equal(w.state.reservedMicros, 1);
+    }
+  }
+});
+
+test('quote-heavy review evidence reports a size stop before provider I/O through the real Gateway serializer', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const { gatewayRequest, endpoint } = await import('../gateway-request.js');
+  const instructions = await readFile(new URL('../agent/instructions.md', import.meta.url), 'utf8');
+  const w = fixture(); w.state.model = HOSTED_MODEL;
+  let sends = 0; let envelopeBytes = 0;
+  const patch = '"'.repeat(7000);
+  w.controller.review = createCodeReview({ store: w.store, read: reader(w.task, { patch }), now: w.now, judge: async input => {
+    assert.ok(Buffer.byteLength(JSON.stringify(input)) <= 32_768);
+    const init = { method: 'POST', headers: { 'ai-language-model-id': HOSTED_MODEL }, body: JSON.stringify({ maxOutputTokens: 2048,
+      prompt: [{ role: 'system', content: instructions }, { role: 'user', content: JSON.stringify(input) }],
+      tools: [{ type: 'function', name: 'final_output', inputSchema: codeReviewSchema.toJSONSchema() }] }) };
+    envelopeBytes = Buffer.byteLength(gatewayRequest(endpoint, init, HOSTED_MODEL).serialized);
+    assert.ok(envelopeBytes > 48_000);
+    await hostedTransport({ store: w.store, requestId: input.hostedRequestId, inputDigest: digest(input), sessionId: 'synthetic-quoted-review', now: w.now,
+      send: async () => { sends++; return new Response('synthetic'); } })(endpoint, init);
+  } });
+  await w.controller.run();
+  const record = Object.values(w.state.requests)[0];
+  assert.equal(record.status, 'not_sent'); assert.equal(record.provider, undefined);
+  assert.deepEqual(record.admissionFailure, { code: 'REVIEW_CONTEXT_TOO_LARGE', requestBytes: envelopeBytes, at: w.now() });
+  assert.equal(w.task.followThrough.reason, 'Patch exceeds the review limit. Split the task or review this PR manually.');
+  assert.equal(w.state.reservedMicros, 1); assert.equal(sends, 0);
+  assert.equal(Object.values(w.state.requests).filter(r => r.provider).length, 0);
+  await w.controller.run(); assert.equal(sends, 0); assert.equal(w.task.followThrough.reviews.length, 1);
 });
